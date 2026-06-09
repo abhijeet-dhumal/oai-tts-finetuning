@@ -32,11 +32,16 @@ import math
 import os
 import sys
 import time
+import warnings
+import urllib3
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+warnings.filterwarnings("ignore", category=urllib3.exceptions.InsecureRequestWarning)
+
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -369,6 +374,14 @@ class VitsGANTrainer:
             if "decoder" not in name:
                 p.requires_grad_(True)
 
+        # Small weight init — prevents discriminator from overflowing at step 1
+        # (random init at default scale causes NaN gradients with LR=2e-4)
+        for m in self.disc.modules():
+            if isinstance(m, (torch.nn.Conv1d, torch.nn.ConvTranspose1d, torch.nn.Linear)):
+                torch.nn.init.normal_(m.weight, mean=0.0, std=0.01)
+                if m.bias is not None:
+                    torch.nn.init.zeros_(m.bias)
+
         gen_trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         gen_total     = sum(p.numel() for p in self.model.parameters())
         disc_params   = sum(p.numel() for p in self.disc.parameters())
@@ -457,9 +470,10 @@ class VitsGANTrainer:
             kl = kl_loss(z_p, logs_q, m_p_exp, logs_p_exp, spec_mask)
 
             # ── Decode z_q → reconstructed waveform (teacher-forced) ──────────
-            # Decoder is frozen but gradients flow through it back to flow/enc
-            with torch.backends.cuda.sdp_kernel(enable_flash=False):
-                fake_wav = self.raw_model.decoder(z_q)  # (B, 1, T_wav_gen)
+            # Decoder is frozen but gradients flow through it back to flow/enc.
+            # Flash Attention enabled (removed the explicit disable — HiFi-GAN
+            # decoder has no attention, and the text encoder benefits from FA).
+            fake_wav = self.raw_model.decoder(z_q)  # (B, 1, T_wav_gen)
             fake_wav = fake_wav.squeeze(1)           # (B, T_wav_gen)
             # Trim both to the minimum length — generator output length may differ
             # from padded real waveform by a few samples
@@ -471,20 +485,35 @@ class VitsGANTrainer:
             m_loss = mel_loss(real_wav, fake_wav, device)
 
         # ── Discriminator update ───────────────────────────────────────────────
-        # fake_wav.detach() stops generator gradients flowing into the discriminator.
+        # Cache r_fmaps here — reused in the generator update for feature matching.
+        # Avoids a full discriminator forward on real_wav a second time.
         with torch.autocast(device_type=device.type, dtype=torch.float16,
                             enabled=use_fp16):
-            r_scores, f_scores, _, _ = self.disc(real_wav, fake_wav.detach())
+            r_scores, f_scores, r_fmaps, _ = self.disc(real_wav, fake_wav.detach())
             d_loss = disc_loss(r_scores, f_scores) / self.args.grad_accum
-        scaler_d.scale(d_loss).backward()
+
+        # NaN guard: if discriminator diverged, reinitialize weights and skip D step
+        _disc_nan = not torch.isfinite(d_loss)
+        if _disc_nan:
+            log.warning("Discriminator loss is NaN — reinitializing disc weights and skipping D step")
+            for m in self.disc.modules():
+                if isinstance(m, (torch.nn.Conv1d, torch.nn.ConvTranspose1d, torch.nn.Linear)):
+                    torch.nn.init.normal_(m.weight, mean=0.0, std=0.01)
+                    if m.bias is not None: torch.nn.init.zeros_(m.bias)
+        else:
+            scaler_d.scale(d_loss).backward()
 
         # ── Generator update ───────────────────────────────────────────────────
         with torch.autocast(device_type=device.type, dtype=torch.float16,
                             enabled=use_fp16):
-            _, f_scores_g, r_fmaps, f_fmaps = self.disc(real_wav, fake_wav)
+            _, f_scores_g, _, f_fmaps = self.disc(real_wav.detach(), fake_wav)
             g_adv  = gen_adv_loss(f_scores_g)
             fm     = fmap_loss(r_fmaps, f_fmaps)
-            g_loss = (m_loss * 45.0 + kl * 1.0 + g_adv * 1.0 + fm * 1.0) / self.args.grad_accum
+            # Fall back to mel+KL only when discriminator is recovering from NaN
+            if _disc_nan:
+                g_loss = (m_loss * 45.0 + kl * 1.0) / self.args.grad_accum
+            else:
+                g_loss = (m_loss * 45.0 + kl * 1.0 + g_adv * 1.0 + fm * 1.0) / self.args.grad_accum
         scaler_g.scale(g_loss).backward()
 
         # Report unscaled per-sample losses (multiply back by grad_accum)
@@ -524,8 +553,8 @@ class VitsGANTrainer:
         )
         eval_loader = DataLoader(
             eval_ds, batch_size=self.args.batch_size, shuffle=False,
-            collate_fn=collator, num_workers=2, drop_last=False,
-            persistent_workers=True,
+            collate_fn=collator, num_workers=2, pin_memory=True,
+            drop_last=False, persistent_workers=True,
         )
 
         # eps=1e-9 matches original VITS paper and all reference implementations
@@ -537,7 +566,7 @@ class VitsGANTrainer:
         )
         opt_d = torch.optim.AdamW(
             self.disc.parameters(),
-            lr=self.args.learning_rate, betas=(0.8, 0.99), eps=1e-9, weight_decay=0.0,
+            lr=self.args.learning_rate * 0.25, betas=(0.8, 0.99), eps=1e-9, weight_decay=0.0,
         )
 
         # ExponentialLR per epoch (gamma=0.999875) — the universal scheduler in every
@@ -597,6 +626,27 @@ class VitsGANTrainer:
                 if self.args.max_steps and global_step >= self.args.max_steps:
                     break
 
+                # ── Coordinated MAS pre-screen ────────────────────────────────────
+                # DDP assigns DIFFERENT data to each rank, so rank 0 may hit a bad
+                # batch (T_spec < S_text) while rank 1 doesn't. If we let one rank
+                # skip and continue, the DDP allreduce inside backward() on the next
+                # batch will hang — one rank calls backward() while the other is in
+                # a different collective. Fix: agree on the skip BEFORE any compute
+                # via a cheap scalar all_reduce, so both ranks skip together.
+                wav_lens = batch["wav_lengths"]
+                txt_lens = batch["text_lengths"]
+                spec_lens = (wav_lens.float() / HOP_LENGTH).ceil().long()
+                local_bad = int((spec_lens < txt_lens).any())
+                if dist.is_initialized():
+                    bad_flag = torch.tensor(local_bad, dtype=torch.long, device=device)
+                    dist.all_reduce(bad_flag, op=dist.ReduceOp.MAX)
+                    local_bad = bad_flag.item()
+                if local_bad:
+                    log.warning(f"Pre-screen skip at step_count {step_count}: "
+                                f"min spec_len={spec_lens.min().item()} < "
+                                f"max txt_len={txt_lens.max().item()}")
+                    continue
+
                 try:
                     metrics = self.training_step(
                         batch, device, scaler_g, scaler_d, opt_g, opt_d, accelerator
@@ -610,7 +660,10 @@ class VitsGANTrainer:
                         opt_d.zero_grad(set_to_none=True)
                         torch.cuda.empty_cache()
                         gc.collect()
-                        accelerator.wait_for_everyone()
+                        # No wait_for_everyone() here — adding a barrier mid-loop
+                        # causes a different deadlock when ranks hit different
+                        # collectives. OOM is typically symmetric (both ranks OOM)
+                        # so just continue independently.
                         continue
                     raise
 
@@ -651,24 +704,32 @@ class VitsGANTrainer:
                     if self.mlflow_run:
                         self._mlflow_log(avgs, global_step)
 
-                if global_step % self.args.eval_steps == 0 and accelerator.is_main_process:
-                    mel_v = self._eval_mel(eval_loader, device)
-                    log.info(f"  Eval mel_loss: {mel_v:.4f}")
-                    # First eval: log baseline (untrained) + reference (mms-tts-tur) for comparison
-                    if global_step == self.args.eval_steps:
-                        self._mlflow_log_audio_artifacts(device, 0, tag="baseline")
-                        self._mlflow_log_reference_audio(device)
-                    # Audio artifacts + spectrogram images — track quality over time
-                    self._mlflow_log_audio_artifacts(device, global_step, tag="eval")
-                    self._mlflow_log_loss_plot(_loss_history, global_step)
-                    if self.mlflow_run:
-                        self._mlflow_log({"eval/mel_loss": mel_v}, global_step)
-                    if mel_v < best_mel:
-                        best_mel = mel_v
-                        self._save(accelerator, "best")
+                if global_step % self.args.eval_steps == 0:
+                    # All ranks park here while rank 0 does eval + MLflow work.
+                    accelerator.wait_for_everyone()
+                    if accelerator.is_main_process:
+                        mel_v = self._eval_mel(eval_loader, device)
+                        self._last_mel_v = f"{mel_v:.4f}"
+                        log.info(f"  Eval mel_loss: {mel_v:.4f}")
+                        # On first eval, generate baseline + reference audio and
+                        # cache numpy arrays so every subsequent step can include
+                        # them in the same folder without re-loading the models.
+                        if global_step == self.args.eval_steps:
+                            self._cache_comparison_audio(device)
+                        self._mlflow_log_step_comparison(device, global_step)
+                        self._mlflow_log_loss_plot(_loss_history, global_step)
+                        if self.mlflow_run:
+                            self._mlflow_log({"eval/mel_loss": mel_v}, global_step)
+                        if mel_v < best_mel:
+                            best_mel = mel_v
+                            self._save(accelerator, "best")
+                    accelerator.wait_for_everyone()
 
-                if global_step % self.args.save_steps == 0 and accelerator.is_main_process:
-                    self._save(accelerator, f"step-{global_step}")
+                if global_step % self.args.save_steps == 0:
+                    accelerator.wait_for_everyone()
+                    if accelerator.is_main_process:
+                        self._save(accelerator, f"step-{global_step}")
+                    accelerator.wait_for_everyone()
 
             # ExponentialLR steps once per epoch — matches original VITS training protocol
             sched_g.step()
@@ -677,13 +738,14 @@ class VitsGANTrainer:
             if self.args.max_steps and global_step >= self.args.max_steps:
                 break
 
+        accelerator.wait_for_everyone()
         if accelerator.is_main_process:
             self._save(accelerator, "final")
             self._eval_wer(device)
-            # Final audio comparison + loss plot
             self._mlflow_log_audio_artifacts(device, global_step, tag="final")
             self._mlflow_log_loss_plot(_loss_history, global_step)
             self._mlflow_log_model(accelerator, "final")
+        accelerator.wait_for_everyone()
         log.info(f"Training complete. Best eval mel: {best_mel:.4f}")
 
     # ── Helpers ────────────────────────────────────────────────────────────────
@@ -760,6 +822,30 @@ class VitsGANTrainer:
         torch.save(unwrapped_d.state_dict(), str(out / "discriminator.pt"))
         log.info(f"  Checkpoint → {out}")
 
+        if not self.mlflow_run:
+            return
+        try:
+            import mlflow
+            for fname in ("config.json", "tokenizer_config.json",
+                          "tokenizer.json", "special_tokens_map.json"):
+                p = out / fname
+                if p.exists():
+                    mlflow.log_artifact(str(p), artifact_path=f"checkpoints/{tag}")
+            run_id = mlflow.active_run().info.run_id
+            mv = mlflow.register_model(
+                f"runs:/{run_id}/checkpoints/{tag}",
+                "mms-tts-turkish",
+            )
+            client = mlflow.MlflowClient()
+            client.set_model_version_tag("mms-tts-turkish", mv.version, "checkpoint_tag", tag)
+            client.set_model_version_tag("mms-tts-turkish", mv.version,
+                                         "checkpoint_pvc_path", str(out))
+            if tag == "final":
+                client.set_model_version_tag("mms-tts-turkish", mv.version, "stage", "final")
+            log.info(f"  Registered mms-tts-turkish v{mv.version} ({tag})")
+        except Exception as e:
+            log.warning(f"Checkpoint registration failed ({tag}): {e}")
+
     def _mlflow_log(self, metrics: Dict, step: int) -> None:
         try:
             import mlflow
@@ -805,6 +891,217 @@ class VitsGANTrainer:
             self.model.train()
         except Exception as e:
             log.debug(f"MLflow audio artifact logging failed: {e}")
+            self.model.train()
+
+    def _cache_comparison_audio(self, device: torch.device) -> None:
+        """Generate baseline (mms-tts-eng) and reference (mms-tts-tur) audio once
+        and cache as numpy arrays so every eval step can include them without
+        reloading the models."""
+        try:
+            import soundfile as sf
+            from transformers import VitsModel, VitsTokenizer
+
+            self._comparison_wavs: list = []  # [(text, baseline_np, reference_np)]
+
+            log.info("Caching baseline (mms-tts-eng) audio …")
+            base_model = VitsModel.from_pretrained(
+                "facebook/mms-tts-eng", cache_dir=self.args.hf_cache
+            ).to(device).eval()
+            base_tok = VitsTokenizer.from_pretrained(
+                "facebook/mms-tts-eng", cache_dir=self.args.hf_cache
+            )
+
+            log.info("Caching reference (mms-tts-tur) audio …")
+            ref_model = VitsModel.from_pretrained(
+                "facebook/mms-tts-tur", cache_dir=self.args.hf_cache
+            ).to(device).eval()
+            ref_tok = VitsTokenizer.from_pretrained(
+                "facebook/mms-tts-tur", cache_dir=self.args.hf_cache
+            )
+
+            with torch.no_grad():
+                for text in EVAL_TEXTS[:5]:
+                    try:
+                        b_wav = base_model(
+                            **base_tok(text, return_tensors="pt").to(device)
+                        ).waveform.squeeze().cpu().numpy()
+                    except Exception:
+                        b_wav = np.zeros(TARGET_SR, dtype=np.float32)
+                    try:
+                        r_wav = ref_model(
+                            **ref_tok(text, return_tensors="pt").to(device)
+                        ).waveform.squeeze().cpu().numpy()
+                    except Exception:
+                        r_wav = np.zeros(TARGET_SR, dtype=np.float32)
+                    self._comparison_wavs.append((text, b_wav, r_wav))
+
+            del base_model, ref_model
+            torch.cuda.empty_cache()
+            log.info(f"Cached {len(self._comparison_wavs)} comparison pairs.")
+        except Exception as e:
+            log.warning(f"Comparison audio cache failed: {e}")
+            self._comparison_wavs = []
+
+    def _get_whisper(self):
+        """Lazy-load Whisper-small on CPU — shared across eval steps."""
+        if not hasattr(self, "_whisper_mdl"):
+            try:
+                import whisper
+                self._whisper_mdl = whisper.load_model("small", device="cpu")
+                log.info("Whisper-small loaded on CPU for per-step WER/CER")
+            except Exception as e:
+                log.warning(f"Whisper unavailable: {e}")
+                self._whisper_mdl = None
+        return self._whisper_mdl
+
+    def _mlflow_log_step_comparison(self, device: torch.device, step: int) -> None:
+        """Log all three audio tracks (baseline / fine-tuned / reference) into a
+        single MLflow folder per step so reviewers can do A/B/C comparison.
+
+        Folder layout per step:
+            audio/step{N:06d}/
+                text00_baseline.wav    ← mms-tts-eng (English model, unchanged)
+                text00_finetuned.wav   ← our model at step N
+                text00_reference.wav   ← mms-tts-tur (gold-standard Turkish)
+                spectrogram.png        ← mel spectrograms of all three
+        """
+        if not self.mlflow_run:
+            return
+        try:
+            import mlflow, soundfile as sf, tempfile
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            import librosa, librosa.display
+
+            _has_trace = hasattr(mlflow, "trace")
+            self.model.eval()
+            artifact_path = f"audio/step{step:06d}"
+            tmp = Path(tempfile.mkdtemp())
+
+            comparison = getattr(self, "_comparison_wavs", [])
+            n = min(len(EVAL_TEXTS), 5)
+            fig_rows = n
+            fig, axes = plt.subplots(fig_rows, 3, figsize=(18, 3 * fig_rows))
+            if fig_rows == 1:
+                axes = [axes]
+            col_titles = ["Baseline (mms-tts-eng)", f"Fine-tuned (step {step})", "Reference (mms-tts-tur)"]
+
+            step_wers, step_cers = [], []
+            whisper_mdl = self._get_whisper()
+
+            with torch.no_grad():
+                for i, text in enumerate(EVAL_TEXTS[:n]):
+                    # Fine-tuned audio — traced
+                    try:
+                        t0 = time.perf_counter()
+                        inputs = self.tokenizer(text, return_tensors="pt").to(device)
+                        torch.manual_seed(555)
+
+                        if _has_trace:
+                            with mlflow.start_span(name="vits_tts_pipeline", span_type="CHAIN") as root:
+                                root.set_inputs({"text": text, "training_step": step})
+                                with mlflow.start_span(name="tokenise", span_type="PARSER") as sp:
+                                    sp.set_inputs({"text": text})
+                                    sp.set_outputs({"n_tokens": inputs["input_ids"].shape[-1]})
+                                with mlflow.start_span(name="model_forward", span_type="LLM") as sp:
+                                    sp.set_inputs({"input_tokens": inputs["input_ids"].shape[-1]})
+                                    out = self.model(**inputs)
+                                    ft_wav = out.waveform.squeeze().cpu().numpy()
+                                    elapsed = time.perf_counter() - t0
+                                    duration = len(ft_wav) / TARGET_SR
+                                    rtf = elapsed / max(duration, 1e-6)
+                                    sp.set_outputs({"duration_s": round(duration, 3),
+                                                    "sample_rate": TARGET_SR,
+                                                    "rtf": round(rtf, 4)})
+                                root.set_outputs({"duration_s": round(duration, 3),
+                                                  "rtf": round(rtf, 4),
+                                                  "elapsed_s": round(elapsed, 3)})
+                        else:
+                            out = self.model(**inputs)
+                            ft_wav = out.waveform.squeeze().cpu().numpy()
+                            elapsed = time.perf_counter() - t0
+                            duration = len(ft_wav) / TARGET_SR
+                            rtf = elapsed / max(duration, 1e-6)
+
+                        mlflow.log_metrics({
+                            f"rtf/text{i:02d}": rtf,
+                            f"duration_s/text{i:02d}": duration,
+                        }, step=step)
+
+                        # WER/CER via Whisper
+                        if whisper_mdl is not None:
+                            try:
+                                from jiwer import wer as j_wer, cer as j_cer
+                                hyp = whisper_mdl.transcribe(
+                                    ft_wav.astype(np.float32),
+                                    language="tr",
+                                    initial_prompt="Türkçe konuşma.",
+                                )["text"].strip().lower()
+                                ref = text.strip().lower()
+                                wer_v = j_wer(ref, hyp)
+                                cer_v = j_cer(ref, hyp)
+                                step_wers.append(wer_v)
+                                step_cers.append(cer_v)
+                                mlflow.log_metrics({
+                                    f"wer/text{i:02d}": wer_v,
+                                    f"cer/text{i:02d}": cer_v,
+                                }, step=step)
+                                log.info(f"  [text{i:02d}] WER={wer_v:.3f} CER={cer_v:.3f} hyp: {hyp[:60]}")
+                            except Exception as e:
+                                log.debug(f"WER/CER failed text{i}: {e}")
+
+                    except Exception:
+                        ft_wav = np.zeros(TARGET_SR, dtype=np.float32)
+
+                    b_wav = comparison[i][1] if i < len(comparison) else np.zeros(TARGET_SR, dtype=np.float32)
+                    r_wav = comparison[i][2] if i < len(comparison) else np.zeros(TARGET_SR, dtype=np.float32)
+
+                    for fname, wav in [
+                        (f"text{i:02d}_baseline.wav",  b_wav),
+                        (f"text{i:02d}_finetuned.wav", ft_wav),
+                        (f"text{i:02d}_reference.wav", r_wav),
+                    ]:
+                        sf.write(str(tmp / fname), wav, samplerate=TARGET_SR)
+                        mlflow.log_artifact(str(tmp / fname), artifact_path=artifact_path)
+
+                    # Spectrogram row
+                    for col, (wav, title) in enumerate(zip([b_wav, ft_wav, r_wav], col_titles)):
+                        ax = axes[i][col]
+                        mel = librosa.feature.melspectrogram(
+                            y=wav, sr=TARGET_SR, n_fft=N_FFT,
+                            hop_length=HOP_LENGTH, n_mels=N_MELS,
+                        )
+                        librosa.display.specshow(
+                            librosa.power_to_db(mel, ref=np.max),
+                            ax=ax, sr=TARGET_SR, hop_length=HOP_LENGTH,
+                        )
+                        if i == 0:
+                            ax.set_title(title, fontsize=9)
+                        ax.set_ylabel(f"s{i}", fontsize=7)
+
+            # Aggregate WER/CER means
+            if step_wers:
+                mlflow.log_metrics({
+                    "wer/mean": float(np.mean(step_wers)),
+                    "cer/mean": float(np.mean(step_cers)),
+                }, step=step)
+
+            fig.suptitle(
+                f"Step {step} — mel_loss={getattr(self, '_last_mel_v', '?')}"
+                + (f"  WER={np.mean(step_wers):.3f}  CER={np.mean(step_cers):.3f}"
+                   if step_wers else ""),
+                fontsize=10,
+            )
+            plt.tight_layout()
+            spec_path = tmp / f"spectrogram_step{step:06d}.png"
+            fig.savefig(str(spec_path), dpi=80, bbox_inches="tight")
+            plt.close(fig)
+            mlflow.log_artifact(str(spec_path), artifact_path=artifact_path)
+
+            self.model.train()
+        except Exception as e:
+            log.debug(f"Step comparison logging failed: {e}")
             self.model.train()
 
     def _mlflow_log_spectrograms(
@@ -967,20 +1264,22 @@ class VitsGANTrainer:
             return
         try:
             import mlflow
+            world = int(os.getenv("WORLD_SIZE", 1))
             tags = {
-                "training.strategy":    "full_vits_gan",
-                "training.frozen":      "decoder/HiFiGAN",
-                "training.trained":     "text_encoder,posterior_encoder,flow",
-                "model.base":           self.args.base_model,
-                "dataset.name":         "afkfatih/turkish-tts-combined-raw",
-                "dataset.language":     "Turkish (tr)",
-                "losses":               "mel×35+KL×1.5+gen_adv+fmap",
+                "base_model":        self.args.base_model,
+                "dataset":           "afkfatih/turkish-tts-combined-raw",
+                "strategy":          "full_vits_gan",
+                "frozen":            "decoder/HiFiGAN",
+                "trained":           "text_encoder,posterior_encoder,flow",
+                "losses":            "mel×45+KL×1.0+gen_adv+fmap",
+                "effective_batch":   str(self.args.batch_size * self.args.grad_accum * world),
+                "n_gpus":            str(world),
+                "platform":          "openshift-ai/kubeflow-trainer-v2",
             }
             if torch.cuda.is_available():
                 gpu = torch.cuda.get_device_properties(0)
-                tags["hardware.gpu"]   = gpu.name
-                tags["hardware.vram"]  = f"{gpu.total_memory // 1024**3}GB"
-                tags["hardware.nodes"] = str(int(os.getenv("WORLD_SIZE", 1)))
+                tags["gpu"]  = gpu.name
+                tags["vram"] = f"{gpu.total_memory // 1024**3}GB"
             mlflow.set_tags(tags)
         except Exception as e:
             log.debug(f"MLflow tag setting failed: {e}")
@@ -1007,9 +1306,9 @@ def parse_args():
                    help="Override num_epochs with a fixed step count")
     p.add_argument("--max_train_samples", type=int, default=int(_env("MAX_TRAIN_SAMPLES")) if _env("MAX_TRAIN_SAMPLES") else None,
                    help="Subset training set for faster iterations")
-    p.add_argument("--eval_steps",    type=int,   default=500)
-    p.add_argument("--save_steps",    type=int,   default=1000)
-    p.add_argument("--logging_steps", type=int,   default=50)
+    p.add_argument("--eval_steps",    type=int,   default=int(_env("EVAL_STEPS",    "500")))
+    p.add_argument("--save_steps",    type=int,   default=int(_env("SAVE_STEPS",    "1000")))
+    p.add_argument("--logging_steps", type=int,   default=int(_env("LOGGING_STEPS", "50")))
     p.add_argument("--fp16",          action="store_true", default=True)
     p.add_argument("--max_wav_seconds", type=float, default=8.0)
     # Checkpointing

@@ -1,0 +1,95 @@
+apiVersion: trainer.kubeflow.org/v1alpha1
+kind: TrainJob
+metadata:
+  name: orpheus-turkish-tts-eval
+  namespace: smartshop
+  labels:
+    app: orpheus-turkish-tts-eval
+    kueue.x-k8s.io/queue-name: smartshop-training
+spec:
+  labels:
+    kueue.x-k8s.io/queue-name: smartshop-training
+  runtimeRef:
+    apiGroup: trainer.kubeflow.org
+    kind: ClusterTrainingRuntime
+    name: torch-distributed-cuda130-torch210-py312
+  trainer:
+    numNodes: 1             # eval runs on a single node
+    numProcPerNode: "gpu"
+    resourcesPerNode:
+      requests:
+        cpu: "8"
+        memory: "48Gi"
+        nvidia.com/gpu: "1"
+      limits:
+        cpu: "16"
+        memory: "64Gi"
+        nvidia.com/gpu: "1"
+    command:
+      - bash
+      - -c
+      - |
+        mkdir -p /tmp/deps
+        pip install -q --target /tmp/deps \
+          "transformers>=4.44.0,<5.0.0" "datasets>=3.0" \
+          "git+https://github.com/hubertsiuzdak/snac.git" \
+          soundfile mlflow openai-whisper jiwer pandas matplotlib utmos
+        export PYTHONPATH=/tmp/deps:$PYTHONPATH
+        python /orpheus-scripts/evaluate_orpheus.py
+    env:
+      - name: FINETUNED_MODEL
+        value: /data/orpheus/checkpoints/turkish/final
+      - name: BASE_MODEL
+        value: "canopylabs/orpheus-tts-0.1-pretrained"
+      - name: HF_HOME
+        value: /data/orpheus/hf-cache
+      - name: WHISPER_MODEL
+        value: "large-v3"
+      - name: EVAL_OUTPUT_DIR
+        value: /data/orpheus/eval
+      - name: MLFLOW_RUN_ID
+        value: ""         # leave blank to create a new eval run, or paste training run ID
+      - name: MLFLOW_EXPERIMENT
+        value: orpheus-turkish-tts
+      - name: MLFLOW_TRACKING_URI
+        value: "https://rh-ai.apps.oai-kft-ibm.ibm.rh-ods.com/mlflow"
+      - name: MLFLOW_TRACKING_AUTH
+        value: "kubernetes-namespaced"
+      - name: MLFLOW_TRACKING_INSECURE_TLS
+        value: "true"
+      - name: PYTORCH_CUDA_ALLOC_CONF
+        value: "expandable_segments:True"
+      - name: HF_TOKEN
+        valueFrom:
+          secretKeyRef:
+            name: hf-credentials
+            key: token
+
+  podTemplateOverrides:
+    - targetJobs:
+        - name: node
+      spec:
+        serviceAccountName: smartshop-training
+        nodeSelector:
+          nvidia.com/gpu.present: "true"
+        containers:
+          - name: node
+            volumeMounts:
+              - name: data
+                mountPath: /data
+              - name: orpheus-scripts
+                mountPath: /orpheus-scripts
+              - name: shm
+                mountPath: /dev/shm
+        volumes:
+          - name: data
+            persistentVolumeClaim:
+              claimName: orpheus-tts-storage
+          - name: orpheus-scripts
+            configMap:
+              name: orpheus-tts-scripts
+              defaultMode: 0755
+          - name: shm
+            emptyDir:
+              medium: Memory
+              sizeLimit: "8Gi"

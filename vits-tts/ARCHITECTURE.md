@@ -16,7 +16,7 @@ The pattern is general-purpose: swap the base model and dataset and the same man
 
 ## Model Architecture
 
-The base model is **VITS** (Variational Inference with adversarial learning for end-to-end Text-to-Speech, Kim et al., ICML 2021). It is a fully end-to-end neural TTS model that learns phoneme alignment, duration, acoustics, and waveform synthesis in a single model with no external aligner.
+The base model is **VITS** (Variational Inference with adversarial learning for end-to-end Text-to-Speech, Kim et al., ICML 2021). It is a fully end-to-end neural TTS model that learns phoneme alignment, duration, acoustics, and waveform synthesis in a single model with no external aligner. `facebook/mms-tts-eng` is licensed CC-BY-NC 4.0.
 
 ```
 Turkish text

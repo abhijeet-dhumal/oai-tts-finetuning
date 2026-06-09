@@ -49,7 +49,7 @@ MIN_DURATION_S = 0.5
 # Characters present in Turkish but missing from the English ASCII tokenizer
 TURKISH_EXTRA_CHARS = list("çğışöüÇĞİŞÖÜ")
 
-SENTINEL_VERSION = "v3-16khz"  # bumped: TARGET_SR changed to 16000
+SENTINEL_VERSION = "v4-tur-base"  # bumped: base model changed to mms-tts-tur
 
 
 def resample_waveform(waveform: np.ndarray, sr: int) -> np.ndarray:
@@ -119,7 +119,8 @@ def main():
     p.add_argument("--val_split", type=float, default=0.05)
     p.add_argument("--num_proc", type=int, default=4)
     p.add_argument("--hf_cache", type=str, default="/data/tts/hf-cache")
-    p.add_argument("--base_model", type=str, default="facebook/mms-tts-eng")
+    p.add_argument("--base_model", type=str,
+                   default=os.environ.get("BASE_MODEL", "facebook/mms-tts-eng"))
     p.add_argument("--force", action="store_true",
                    help="Re-run even if preprocessed data already exists")
     args = p.parse_args()

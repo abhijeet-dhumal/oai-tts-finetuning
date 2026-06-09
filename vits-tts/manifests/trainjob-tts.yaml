@@ -49,19 +49,25 @@ spec:
       - name: BATCH_SIZE
         value: "8"
       - name: GRAD_ACCUM
-        value: "4"
+        value: "2"
       - name: LEARNING_RATE
         value: "2e-4"
       - name: NUM_EPOCHS
         value: "50"
       - name: MAX_STEPS
-        value: ""           # leave empty to use NUM_EPOCHS; set e.g. "5000" for smoke test
+        value: ""
       - name: MAX_TRAIN_SAMPLES
-        value: ""           # full 81K dataset — enough diversity for 8-GPU training
+        value: ""
+      - name: EVAL_STEPS
+        value: "300"
+      - name: SAVE_STEPS
+        value: "500"
       - name: RESUME_FROM
-        value: "/data/tts/checkpoints/mms-turkish/best"  # warm-start from existing checkpoint
+        value: ""
+      - name: BASE_MODEL
+        value: "facebook/mms-tts-eng"
       - name: RUN_EVAL
-        value: "true"       # runs evaluate.py on rank 0 after training
+        value: "true"
 
       # ── MLflow tracking ────────────────────────────────────────────────────
       - name: MLFLOW_TRACKING_URI
