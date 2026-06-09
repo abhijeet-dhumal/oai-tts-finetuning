@@ -1,6 +1,6 @@
 # TTS Fine-Tuning on OpenShift AI — Turkish Language Adaptation
 
-A **production-grade example** of distributed model fine-tuning using **Kubeflow Trainer v2 (TrainJob)** on Red Hat OpenShift AI. The task — adapting a TTS model to Turkish — is a concrete, measurable illustration of the pattern. The real goal is a reusable reference architecture any team can apply to their own domain.
+An example of distributed model fine-tuning using **Kubeflow Trainer v2 (TrainJob)** on Red Hat OpenShift AI. The task — adapting a TTS model to Turkish — is a concrete, measurable illustration of the pattern. The real goal is a reusable reference architecture anyone can apply to their own domain.
 
 ---
 
@@ -62,7 +62,7 @@ Prerequisites: `smartshop-training` ClusterQueue, `smartshop-shared-storage` PVC
 
 ```bash
 # Apply ConfigMap + TrainJob in one command
-oc apply -k examples/tts-finetuning/manifests/
+oc apply -k examples/tts-finetuning/
 
 # Watch progress
 oc get trainjob mms-turkish-tts -n smartshop -w

@@ -4,7 +4,7 @@ kind: Kustomization
 namespace: smartshop
 
 resources:
-  - trainjob-tts.yaml
+  - manifests/trainjob-tts.yaml
 
 # Generates tts-mms-scripts ConfigMap directly from source files.
 # Any edit to scripts/ is automatically picked up on the next apply.
@@ -13,6 +13,6 @@ configMapGenerator:
     options:
       disableNameSuffixHash: true
     files:
-      - ../scripts/preprocess_mms.py
-      - ../scripts/train_vits.py
-      - ../scripts/evaluate.py
+      - scripts/preprocess_mms.py
+      - scripts/train_vits.py
+      - scripts/evaluate.py

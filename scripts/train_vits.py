@@ -15,8 +15,8 @@ Trained:   text_encoder · posterior_encoder · flow
 Frozen:    decoder/vocoder (HiFi-GAN) — preserves audio synthesis quality, saves ~50% VRAM
 Disc init: random (standard VITS approach — no pretrained discriminator available)
 
-Loss weights (community standard):
-  mel×35  +  KL×1.5  +  gen_adv×1  +  feature_maps×1
+Loss weights (original VITS paper, Kim et al. ICML 2021, c_mel=45, c_kl=1.0):
+  mel×45  +  KL×1.0  +  gen_adv×1  +  feature_maps×1
 
 Distributed: torchrun (DDP) — Kubeflow Trainer v2 injects PET_* env vars natively
 MLflow:      auto-integrated via MLFLOW_TRACKING_URI env var
@@ -66,26 +66,23 @@ EVAL_TEXTS = [
 
 # ── Spectral transforms (built on PyTorch STFT, no extra deps) ─────────────────
 
-def _stft(wav: torch.Tensor) -> torch.Tensor:
-    """Linear amplitude spectrogram: (B,T) → (B, SPEC_BINS, frames)."""
-    window = torch.hann_window(WIN_LENGTH, device=wav.device)
-    return torch.stft(
-        wav,
-        n_fft=N_FFT, hop_length=HOP_LENGTH, win_length=WIN_LENGTH,
-        window=window, return_complex=True,
-    ).abs()  # amplitude
-
 
 def compute_linear_spec(wav: torch.Tensor) -> torch.Tensor:
-    """Batch linear spectrogram for posterior encoder.  (B,T) → (B, 513, F)."""
+    """Batch linear spectrogram for posterior encoder.  (B,T) → (B, 513, F).
+
+    Uses a single batched torch.stft call — no Python loop over batch items.
+    All waveforms in a batch are padded to the same length by the collator so
+    the resulting spectrogram tensors are identically shaped.
+    """
     if wav.dim() == 1:
         wav = wav.unsqueeze(0)
-    specs = [_stft(wav[b]) for b in range(wav.shape[0])]
-    max_f = max(s.shape[-1] for s in specs)
-    out = wav.new_zeros(len(specs), SPEC_BINS, max_f)
-    for b, s in enumerate(specs):
-        out[b, :, :s.shape[-1]] = s
-    return out
+    window = torch.hann_window(WIN_LENGTH, device=wav.device)
+    spec = torch.stft(
+        wav.reshape(-1, wav.shape[-1]),           # (B, T) treated as (B*1, T)
+        n_fft=N_FFT, hop_length=HOP_LENGTH, win_length=WIN_LENGTH,
+        window=window, return_complex=True,
+    ).abs()                                        # (B, SPEC_BINS, F)
+    return spec
 
 
 def _build_mel_filterbank(n_fft: int, n_mels: int, sr: int, device: torch.device) -> torch.Tensor:
@@ -399,9 +396,10 @@ class VitsGANTrainer:
         text_lengths   = batch["text_lengths"].to(device)
         wav_lengths    = batch["wav_lengths"].to(device)
 
+        use_fp16 = scaler_g is not None and scaler_g.is_enabled()
         # ── Spectral features ──────────────────────────────────────────────────
         with torch.autocast(device_type=device.type, dtype=torch.float16,
-                            enabled=self.args.fp16):
+                            enabled=use_fp16):
             linear_spec = compute_linear_spec(waveform)  # (B, 513, T_spec)
             spec_lengths = (wav_lengths.float() / HOP_LENGTH).ceil().long()
             T_spec = linear_spec.shape[-1]
@@ -414,7 +412,7 @@ class VitsGANTrainer:
                          < text_lengths.unsqueeze(1)).unsqueeze(2).float()   # (B,T_text,1)
 
             # ── Text encoder → prior distribution ────────────────────────────
-            text_out = self.model.text_encoder(
+            text_out = self.raw_model.text_encoder(
                 input_ids=input_ids,
                 padding_mask=text_mask,
             )
@@ -423,13 +421,13 @@ class VitsGANTrainer:
             logs_p = text_out.prior_log_variances.transpose(1, 2) # (B, C, T_text)
 
             # ── Posterior encoder → latent z ──────────────────────────────────
-            z_q, m_q, logs_q = self.model.posterior_encoder(
+            z_q, m_q, logs_q = self.raw_model.posterior_encoder(
                 linear_spec, spec_mask
             )
             # z_q, m_q, logs_q: (B, C, T_spec)
 
             # ── Flow (forward): z_q → z_p for KL computation ─────────────────
-            z_p = self.model.flow(z_q, spec_mask, reverse=False)  # (B, C, T_spec)
+            z_p = self.raw_model.flow(z_q, spec_mask, reverse=False)  # (B, C, T_spec)
 
             # ── Monotonic Alignment Search ────────────────────────────────────
             with torch.no_grad():
@@ -461,7 +459,7 @@ class VitsGANTrainer:
             # ── Decode z_q → reconstructed waveform (teacher-forced) ──────────
             # Decoder is frozen but gradients flow through it back to flow/enc
             with torch.backends.cuda.sdp_kernel(enable_flash=False):
-                fake_wav = self.model.decoder(z_q)  # (B, 1, T_wav_gen)
+                fake_wav = self.raw_model.decoder(z_q)  # (B, 1, T_wav_gen)
             fake_wav = fake_wav.squeeze(1)           # (B, T_wav_gen)
             # Trim both to the minimum length — generator output length may differ
             # from padded real waveform by a few samples
@@ -473,83 +471,91 @@ class VitsGANTrainer:
             m_loss = mel_loss(real_wav, fake_wav, device)
 
         # ── Discriminator update ───────────────────────────────────────────────
-        opt_d.zero_grad()
+        # fake_wav.detach() stops generator gradients flowing into the discriminator.
         with torch.autocast(device_type=device.type, dtype=torch.float16,
-                            enabled=self.args.fp16):
+                            enabled=use_fp16):
             r_scores, f_scores, _, _ = self.disc(real_wav, fake_wav.detach())
-            d_loss = disc_loss(r_scores, f_scores)
-        accelerator.backward(d_loss)
-        accelerator.clip_grad_norm_(self.disc.parameters(), 1.0)
-        opt_d.step()
+            d_loss = disc_loss(r_scores, f_scores) / self.args.grad_accum
+        scaler_d.scale(d_loss).backward()
 
         # ── Generator update ───────────────────────────────────────────────────
-        opt_g.zero_grad()
         with torch.autocast(device_type=device.type, dtype=torch.float16,
-                            enabled=self.args.fp16):
+                            enabled=use_fp16):
             _, f_scores_g, r_fmaps, f_fmaps = self.disc(real_wav, fake_wav)
             g_adv  = gen_adv_loss(f_scores_g)
             fm     = fmap_loss(r_fmaps, f_fmaps)
-            g_loss = m_loss * 35.0 + kl * 1.5 + g_adv * 1.0 + fm * 1.0
-        accelerator.backward(g_loss)
-        accelerator.clip_grad_norm_(
-            [p for p in self.model.parameters() if p.requires_grad], 1.0
-        )
-        opt_g.step()
+            g_loss = (m_loss * 45.0 + kl * 1.0 + g_adv * 1.0 + fm * 1.0) / self.args.grad_accum
+        scaler_g.scale(g_loss).backward()
 
+        # Report unscaled per-sample losses (multiply back by grad_accum)
         return {
-            "loss/total":   g_loss.item(),
+            "loss/total":   g_loss.item() * self.args.grad_accum,
             "loss/mel":     m_loss.item(),
             "loss/kl":      kl.item(),
-            "loss/gen_adv": g_adv.item(),
-            "loss/fmap":    fm.item(),
-            "loss/disc":    d_loss.item(),
+            "loss/gen_adv": g_adv.item() * self.args.grad_accum,
+            "loss/fmap":    fm.item() * self.args.grad_accum,
+            "loss/disc":    d_loss.item() * self.args.grad_accum,
         }
 
     # ── Main training loop ─────────────────────────────────────────────────────
 
     def train(self, train_ds, eval_ds, collator):
         from accelerate import Accelerator
+        from torch.cuda.amp import GradScaler
 
-        accelerator = Accelerator(
-            mixed_precision="fp16" if self.args.fp16 else "no",
-            gradient_accumulation_steps=self.args.grad_accum,
-        )
+        # Pass mixed_precision="no" — we manage fp16 manually via two GradScalers
+        # (one per optimizer). Accelerator's built-in GradScaler is single-optimizer
+        # and calling optimizer.step() on G triggers unscale_() which then breaks D.
+        accelerator = Accelerator(mixed_precision="no")
         device = accelerator.device
+        use_fp16 = self.args.fp16 and device.type == "cuda"
 
+        # Two independent scalers — essential for stable GAN fp16 training.
+        # If D scaler detects inf/nan it skips only the D step, not G.
+        scaler_g = GradScaler(enabled=use_fp16)
+        scaler_d = GradScaler(enabled=use_fp16)
+
+        # num_workers=4: parallel data loading keeps A100 fed between batches.
+        # persistent_workers avoids re-spawning workers each epoch.
         train_loader = DataLoader(
             train_ds, batch_size=self.args.batch_size, shuffle=True,
-            collate_fn=collator, num_workers=0, pin_memory=True,
-            drop_last=True,
+            collate_fn=collator, num_workers=4, pin_memory=True,
+            drop_last=True, persistent_workers=True,
         )
         eval_loader = DataLoader(
             eval_ds, batch_size=self.args.batch_size, shuffle=False,
-            collate_fn=collator, num_workers=0, drop_last=False,
+            collate_fn=collator, num_workers=2, drop_last=False,
+            persistent_workers=True,
         )
 
+        # eps=1e-9 matches original VITS paper and all reference implementations
+        # (jaywalnut310, coqui-ai, ylacombe). PyTorch default 1e-8 is too large for
+        # the small gradient magnitudes typical in VITS flow/encoder layers.
         opt_g = torch.optim.AdamW(
             [p for p in self.model.parameters() if p.requires_grad],
-            lr=self.args.learning_rate, betas=(0.8, 0.99), weight_decay=0.01,
+            lr=self.args.learning_rate, betas=(0.8, 0.99), eps=1e-9, weight_decay=0.0,
         )
         opt_d = torch.optim.AdamW(
             self.disc.parameters(),
-            lr=self.args.learning_rate, betas=(0.8, 0.99), weight_decay=0.01,
+            lr=self.args.learning_rate, betas=(0.8, 0.99), eps=1e-9, weight_decay=0.0,
         )
 
-        # Cosine LR decay
+        # ExponentialLR per epoch (gamma=0.999875) — the universal scheduler in every
+        # VITS reference (original paper, coqui-ai, jaywalnut310, espnet, ylacombe).
+        # CosineAnnealingLR drops LR too aggressively for GAN fine-tuning.
         max_steps = self.args.max_steps or (
             len(train_loader) * self.args.num_epochs // self.args.grad_accum
         )
-        sched_g = torch.optim.lr_scheduler.CosineAnnealingLR(
-            opt_g, T_max=max_steps, eta_min=self.args.learning_rate * 0.1
-        )
-        sched_d = torch.optim.lr_scheduler.CosineAnnealingLR(
-            opt_d, T_max=max_steps, eta_min=self.args.learning_rate * 0.1
-        )
+        sched_g = torch.optim.lr_scheduler.ExponentialLR(opt_g, gamma=0.999875)
+        sched_d = torch.optim.lr_scheduler.ExponentialLR(opt_d, gamma=0.999875)
 
         (self.model, self.disc, opt_g, opt_d,
          train_loader, eval_loader) = accelerator.prepare(
             self.model, self.disc, opt_g, opt_d, train_loader, eval_loader
         )
+        # DDP wraps self.model — keep a reference to the underlying module for
+        # sub-component access (text_encoder, posterior_encoder, flow, decoder).
+        self.raw_model = accelerator.unwrap_model(self.model)
 
         log.info("=" * 60)
         log.info("  Full VITS GAN Training — Turkish language adaptation")
@@ -578,6 +584,10 @@ class VitsGANTrainer:
         step_count  = 0
         _loss_history: Dict[str, List[float]] = {}
 
+        # Zero grads before first accumulation window
+        opt_g.zero_grad(set_to_none=True)
+        opt_d.zero_grad(set_to_none=True)
+
         for epoch in range(self.args.num_epochs):
             self.model.train()
             self.disc.train()
@@ -589,7 +599,7 @@ class VitsGANTrainer:
 
                 try:
                     metrics = self.training_step(
-                        batch, device, None, None, opt_g, opt_d, accelerator
+                        batch, device, scaler_g, scaler_d, opt_g, opt_d, accelerator
                     )
                 except (RuntimeError, ValueError) as e:
                     err_str = str(e).lower()
@@ -609,9 +619,20 @@ class VitsGANTrainer:
                     epoch_metrics.setdefault(k, []).append(v)
                     _loss_history.setdefault(k, []).append(v)
 
+                # Optimizer step at accumulation boundary — unscale, clip, step, update scaler
                 if step_count % self.args.grad_accum == 0:
-                    sched_g.step()
-                    sched_d.step()
+                    scaler_g.unscale_(opt_g)
+                    scaler_d.unscale_(opt_d)
+                    torch.nn.utils.clip_grad_norm_(
+                        [p for p in self.model.parameters() if p.requires_grad], 1.0
+                    )
+                    torch.nn.utils.clip_grad_norm_(self.disc.parameters(), 1.0)
+                    scaler_g.step(opt_g)
+                    scaler_d.step(opt_d)
+                    scaler_g.update()
+                    scaler_d.update()
+                    opt_g.zero_grad(set_to_none=True)
+                    opt_d.zero_grad(set_to_none=True)
                     global_step += 1
 
                 if step_count % self.args.grad_accum != 0:
@@ -649,6 +670,10 @@ class VitsGANTrainer:
                 if global_step % self.args.save_steps == 0 and accelerator.is_main_process:
                     self._save(accelerator, f"step-{global_step}")
 
+            # ExponentialLR steps once per epoch — matches original VITS training protocol
+            sched_g.step()
+            sched_d.step()
+
             if self.args.max_steps and global_step >= self.args.max_steps:
                 break
 
@@ -676,8 +701,8 @@ class VitsGANTrainer:
                     T_spec = spec.shape[-1]
                     mask = (torch.arange(T_spec, device=device).unsqueeze(0)
                             < spec_lengths.unsqueeze(1)).unsqueeze(1).float()
-                    z_q, _, _ = self.model.posterior_encoder(spec, mask)
-                    fake = self.model.decoder(z_q).squeeze(1)
+                    z_q, _, _ = self.raw_model.posterior_encoder(spec, mask)
+                    fake = self.raw_model.decoder(z_q).squeeze(1)
                     losses.append(mel_loss(wav, fake, device).item())
                 except Exception as e:
                     log.debug(f"Eval batch skipped: {e}")

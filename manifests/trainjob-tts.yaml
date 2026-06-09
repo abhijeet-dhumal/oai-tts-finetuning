@@ -25,9 +25,15 @@ spec:
         cpu: "16"
         memory: "64Gi"
         nvidia.com/gpu: "1"
-    # torchrun reads PET_NNODES / PET_NODE_RANK / PET_MASTER_ADDR / PET_MASTER_PORT
-    # injected by Kubeflow Trainer v2 — no shell wrapper needed (PyTorch >= 2.3).
-    command: ["torchrun", "/scripts/train_vits.py"]
+    command:
+      - bash
+      - -c
+      - |
+        pip install -q --target /deps \
+          "transformers>=4.40.0" "datasets>=3.0" "accelerate>=0.28.0" \
+          soundfile librosa mlflow numpy matplotlib jiwer openai-whisper
+        export PYTHONPATH=/deps:$PYTHONPATH
+        torchrun /scripts/train_vits.py
     env:
       # ── Storage paths ──────────────────────────────────────────────────────
       - name: DATA_ROOT
@@ -40,7 +46,6 @@ spec:
         value: /data/tts/hf-cache
 
       # ── Training hyperparameters ────────────────────────────────────────────
-      # Effective batch = BATCH_SIZE × GRAD_ACCUM × numNodes = 8 × 4 × 2 = 64
       - name: BATCH_SIZE
         value: "8"
       - name: GRAD_ACCUM
@@ -50,11 +55,11 @@ spec:
       - name: NUM_EPOCHS
         value: "50"
       - name: MAX_STEPS
-        value: ""           # leave empty to use NUM_EPOCHS; set e.g. "10000" to cap
+        value: ""           # leave empty to use NUM_EPOCHS; set e.g. "5000" for smoke test
       - name: MAX_TRAIN_SAMPLES
-        value: ""           # leave empty for full dataset; set e.g. "5000" for faster iteration
+        value: ""           # full 81K dataset — enough diversity for 8-GPU training
       - name: RESUME_FROM
-        value: ""           # path to a previous checkpoint dir to warm-start from
+        value: "/data/tts/checkpoints/mms-turkish/best"  # warm-start from existing checkpoint
       - name: RUN_EVAL
         value: "true"       # runs evaluate.py on rank 0 after training
 
@@ -71,8 +76,21 @@ spec:
       # ── GPU / runtime ──────────────────────────────────────────────────────
       - name: PYTORCH_CUDA_ALLOC_CONF
         value: "expandable_segments:True"
-      - name: PYTHONPATH
-        value: "/deps"      # packages installed by install-deps initContainer
+      # NCCL tuning for OpenShift OVN-Kubernetes CNI:
+      # The CNI delivers TCP in 64KB chunks; NCCL auto-negotiates 1MB on one node
+      # and 64KB on the other → "message truncated" crash. Force all ranks to 64KB.
+      - name: NCCL_BUFFSIZE
+        value: "65536"
+      - name: NCCL_SOCKET_NTHREADS
+        value: "1"
+      - name: NCCL_NSOCKS_PERTHREAD
+        value: "1"
+      - name: NCCL_P2P_DISABLE
+        value: "1"
+      - name: NCCL_SHM_DISABLE
+        value: "1"
+      - name: NCCL_DEBUG
+        value: "WARN"
 
       # ── HuggingFace token (from cluster secret) ────────────────────────────
       - name: HF_TOKEN
@@ -88,51 +106,6 @@ spec:
         serviceAccountName: smartshop-training
         nodeSelector:
           nvidia.com/gpu.present: "true"
-        initContainers:
-          # ── Step 1: install pip dependencies into a shared emptyDir ──────
-          - name: install-deps
-            image: "registry.redhat.io/rhoai/odh-th06-cuda130-torch210-py312-rhel9@sha256:551eaedcd6f1337b03ccba34a2a7b1ecb6f7f605646999e4b20461a68b61c0eb"
-            command:
-              - pip
-              - install
-              - "--target=/deps"
-              - "--quiet"
-              - "transformers>=4.40.0"
-              - "datasets>=3.0"
-              - "accelerate>=0.28.0"
-              - soundfile
-              - librosa
-              - mlflow
-              - numpy
-              - matplotlib
-              - jiwer
-              - openai-whisper
-            volumeMounts:
-              - name: deps
-                mountPath: /deps
-          # ── Step 2: preprocess dataset (sentinel-guarded, idempotent) ────
-          - name: preprocess
-            image: "registry.redhat.io/rhoai/odh-th06-cuda130-torch210-py312-rhel9@sha256:551eaedcd6f1337b03ccba34a2a7b1ecb6f7f605646999e4b20461a68b61c0eb"
-            command:
-              - python3
-              - /scripts/preprocess_mms.py
-              - "--out_dir=/data/tts/mms-dataset"
-              - "--hf_cache=/data/tts/hf-cache"
-            env:
-              - name: PYTHONPATH
-                value: "/deps"
-              - name: HF_TOKEN
-                valueFrom:
-                  secretKeyRef:
-                    name: hf-credentials
-                    key: token
-            volumeMounts:
-              - name: data
-                mountPath: /data
-              - name: scripts
-                mountPath: /scripts
-              - name: deps
-                mountPath: /deps
         containers:
           - name: node
             volumeMounts:
@@ -142,8 +115,6 @@ spec:
                 mountPath: /scripts
               - name: shm
                 mountPath: /dev/shm
-              - name: deps
-                mountPath: /deps
         volumes:
           - name: data
             persistentVolumeClaim:
@@ -156,5 +127,3 @@ spec:
             emptyDir:
               medium: Memory
               sizeLimit: "8Gi"
-          - name: deps
-            emptyDir: {}   # shared by initContainers (install/preprocess) and trainer
