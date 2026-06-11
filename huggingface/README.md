@@ -76,7 +76,7 @@ Orpheus frames TTS as **causal LM over SNAC audio tokens**: Turkish text → con
 
 ## How this model was trained
 
-End-to-end pipeline (reproducible from [GitHub manifests](https://github.com/abhijeet-dhumal/oai-tts-finetuning/tree/main/orpheus-tts)):
+End-to-end pipeline (reproducible from [GitHub manifests](https://github.com/abhijeet-dhumal/oai-tts-finetuning)):
 
 | Step | What | Config / script |
 |------|------|-----------------|
@@ -290,7 +290,7 @@ out = model.generate(torch.tensor([prompt]).cuda(), max_new_tokens=1500, min_new
 
 ```bash
 git clone https://github.com/abhijeet-dhumal/oai-tts-finetuning.git
-cd oai-tts-finetuning/orpheus-tts
+cd oai-tts-finetuning
 
 # ConfigMap (scripts) + PVC
 oc kustomize . | oc apply -f - -n <namespace>

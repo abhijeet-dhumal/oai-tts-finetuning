@@ -1,58 +1,139 @@
-# TTS Fine-Tuning on Red Hat OpenShift AI
+# Orpheus Turkish TTS — OpenShift AI / Kubeflow Trainer v2
 
-Distributed Text-to-Speech fine-tuning examples using **Kubeflow Trainer v2** on Red Hat OpenShift AI. Two complementary approaches for adapting TTS models to a new language (Turkish), each showcasing a different generation paradigm.
+Fine-tune [unsloth/orpheus-3b-0.1-pretrained](https://huggingface.co/unsloth/orpheus-3b-0.1-pretrained) for **Turkish text-to-speech** using LoRA on a SNAC 24 kHz codec vocabulary. Trained on Red Hat OpenShift AI with **Kubeflow Trainer v2 (TrainJob)**.
 
----
-
-## Examples
-
-### [`orpheus-tts/`](./orpheus-tts/)
-
-Fine-tunes **Orpheus-3B** — a codec language model (Llama-3 backbone) that generates speech as SNAC audio tokens. Training is standard next-token prediction with HuggingFace `Trainer`. No custom GAN or aligner needed.
-
-- **Model:** `unsloth/orpheus-3b-0.1-pretrained` (3.3B params, bfloat16)
-- **Output:** 24kHz natural-sounding speech via SNAC codec
-- **Training:** Causal LM cross-entropy, DDP across 2× A100-80GB
-- **Preprocessing:** Distributed SNAC tokenization (5K samples/node in parallel)
-
-→ [README](./orpheus-tts/README.md) · [Architecture](./orpheus-tts/ARCHITECTURE.md) · [HF model](https://huggingface.co/AbDhumal/orpheus-3b-turkish-tts-v2)
+| Deliverable | Link |
+|-------------|------|
+| **Fine-tuned weights** | [AbDhumal/orpheus-3b-turkish-tts-v2](https://huggingface.co/AbDhumal/orpheus-3b-turkish-tts-v2) |
+| **Model card source** | [`huggingface/README.md`](huggingface/README.md) |
+| **Architecture deep-dive** | [`ARCHITECTURE.md`](ARCHITECTURE.md) |
 
 ---
 
-### [`vits-tts/`](./vits-tts/)
+## Results (v2 training · eval-v4)
 
-Fine-tunes **MMS-TTS** (VITS architecture) — a GAN-based end-to-end TTS model with an integrated HiFi-GAN vocoder. Trains text encoder, posterior encoder, and normalizing flow against both reconstruction and adversarial losses.
+| Metric | Baseline (English pretrained) | Fine-tuned (`final/`) | Δ |
+|--------|-------------------------------|------------------------|---|
+| **WER mean** | 1.58 | **0.72** | −0.85 |
+| **CER mean** | 1.22 | **0.41** | −0.81 |
+| **eval_loss** (training) | — | **4.35** | best @ step 8,800 |
 
-- **Model:** `facebook/mms-tts-eng` (36M params, full GAN)
-- **Output:** 16kHz speech with naturalness from adversarial training
-- **Training:** Generator + discriminator with separate GradScalers, DDP across 2× GPU
-- **Preprocessing:** Tokenizer vocabulary expansion + audio resampling (sentinel-guarded)
+Training: 2× A100-80GB · 20K samples · 8 epochs · 9,504 steps · LoRA r=32 α=64 · merged from checkpoint-8800.
 
-→ [README](./vits-tts/README.md) · [Architecture](./vits-tts/ARCHITECTURE.md)
+Audio samples and charts live on the [HF model card](https://huggingface.co/AbDhumal/orpheus-3b-turkish-tts-v2#audio-samples). Pushing this repo to GitHub does **not** upload weights — use `manifests/job-hf-upload.yaml` on the cluster.
 
 ---
 
-## Common Infrastructure
+## Repository layout
 
-Both examples share the same Kubeflow Trainer v2 pattern:
+```
+├── scripts/
+│   ├── train_orpheus.py
+│   ├── evaluate_orpheus.py
+│   ├── save_final_orpheus.py
+│   ├── stage_hf_samples.py
+│   ├── upload_to_hf.py
+│   └── export_mlflow_snapshots.py
+├── manifests/
+│   ├── pvc.yaml
+│   ├── trainjob-orpheus.yaml
+│   ├── trainjob-orpheus-eval.yaml
+│   └── job-hf-upload.yaml
+├── huggingface/          # model card template + eval charts
+├── kustomization.yaml
+├── ARCHITECTURE.md
+└── README.md
+```
 
-| Layer | Detail |
-|-------|--------|
-| **Orchestration** | `TrainJob` CRD — provisions pods, headless service, injects `PET_*` env vars for `torchrun` |
-| **GPU quota** | Kueue `ClusterQueue` enforces per-namespace limits |
-| **Scripts** | Served from a `ConfigMap` built by Kustomize — no image rebuild on script changes |
-| **Storage** | Shared PVC for model cache, preprocessed dataset, and checkpoints |
-| **Tracking** | OpenShift AI managed MLflow — metrics, audio artifacts, spectrograms, model registry |
-| **Secrets** | HuggingFace token + MLflow token from cluster secrets via `secretKeyRef` |
+> **Archive:** the prior multi-example layout (`orpheus-tts/` + `vits-tts/` subdirs) is preserved on branch [`archive/multi-example-layout`](https://github.com/abhijeet-dhumal/oai-tts-finetuning/tree/archive/multi-example-layout).
 
-## Deploy Either Example
+---
+
+## Prerequisites
+
+- OpenShift AI cluster with Kubeflow Trainer v2 (`TrainJob` CRD)
+- Kueue `ClusterQueue` (example uses `smartshop-training`)
+- GPU nodes with `nvidia.com/gpu`
+- Secrets: `hf-credentials` (HuggingFace token), `smartshop-mlflow-token`
+- Runtime: `torch-distributed-cuda130-torch210-py312`
+
+Adjust `namespace`, queue name, and MLflow URI in manifests for your environment.
+
+---
+
+## Deploy
+
+### 1. ConfigMap + PVC
 
 ```bash
-# Orpheus TTS
-cd orpheus-tts
-kubectl kustomize . | oc apply -f - -n smartshop
-
-# VITS / MMS TTS
-cd vits-tts
-kubectl kustomize . | oc apply -f - -n smartshop
+git clone https://github.com/abhijeet-dhumal/oai-tts-finetuning.git
+cd oai-tts-finetuning
+kubectl kustomize . | oc apply -f - -n <namespace>
 ```
+
+### 2. Train
+
+```bash
+oc apply -f manifests/trainjob-orpheus.yaml -n <namespace>
+oc get trainjob orpheus-turkish-tts-v2 -n <namespace> -w
+```
+
+Key env vars are in `trainjob-orpheus.yaml` (`LEARNING_RATE=2e-5`, `NUM_EPOCHS=8`, `MAX_TRAIN_SAMPLES=20000`, `LORA_R=32`, …).
+
+### 3. Merge best checkpoint
+
+```bash
+# On a GPU pod with PVC mounted:
+python /orpheus-scripts/save_final_orpheus.py
+# → /data/orpheus/checkpoints/turkish-v2/final/
+```
+
+### 4. Post-train eval
+
+```bash
+oc apply -f manifests/trainjob-orpheus-eval.yaml -n <namespace>
+# Output: /data/orpheus/eval-v4-final/
+```
+
+### 5. Publish to Hugging Face (optional)
+
+```bash
+oc create configmap orpheus-hf-card -n <namespace> \
+  --from-file=hf-README.md=huggingface/README.md \
+  --from-file=results.json=huggingface/eval/results.json \
+  --dry-run=client -o yaml | oc apply -f -
+
+oc apply -f manifests/job-hf-upload.yaml -n <namespace>
+```
+
+Set `UPLOAD_MODE` in the job manifest: `eval` (default), `full` (weights + eval), or `readme`. Requires `HF_TOKEN` with write access (`HF_REPO_ID` env).
+
+---
+
+## MLflow
+
+Experiment: `orpheus-turkish-tts`
+
+| Run | ID | Notes |
+|-----|-----|-------|
+| Training v2 | `6804b44335f347849f26da2736aa73df` | loss, in-train audio, WER/CER |
+| Eval v4 | `50c177d696164b4a83169292b2109b4e` | 10-sentence benchmark |
+
+Static chart exports: [`huggingface/eval/mlflow/`](huggingface/eval/mlflow/)
+
+---
+
+## Updating scripts on the cluster
+
+After editing Python files locally:
+
+```bash
+kubectl kustomize . | oc apply -f - -n <namespace>
+# Re-apply TrainJob / Job to pick up new ConfigMap
+```
+
+---
+
+## Related
+
+- Hugging Face model: [AbDhumal/orpheus-3b-turkish-tts-v2](https://huggingface.co/AbDhumal/orpheus-3b-turkish-tts-v2)
