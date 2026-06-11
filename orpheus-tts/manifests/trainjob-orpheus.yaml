@@ -1,7 +1,8 @@
+# 2-node LoRA training (v2 hyperparameters). Requires preprocessed data on PVC.
 apiVersion: trainer.kubeflow.org/v1alpha1
 kind: TrainJob
 metadata:
-  name: orpheus-turkish-tts
+  name: orpheus-turkish-tts-v2
   namespace: smartshop
   labels:
     app: orpheus-turkish-tts
@@ -15,11 +16,11 @@ spec:
     name: torch-distributed-cuda130-torch210-py312
   trainer:
     numNodes: 2
-    numProcPerNode: "gpu"   # 1 GPU per node → 2 DDP processes total
+    numProcPerNode: "gpu"
     resourcesPerNode:
       requests:
         cpu: "8"
-        memory: "48Gi"        # Llama-3B in bf16 ≈ 6GB; headroom for SNAC + batch
+        memory: "48Gi"
         nvidia.com/gpu: "1"
       limits:
         cpu: "16"
@@ -29,77 +30,82 @@ spec:
       - bash
       - -c
       - |
-        DEPS=/data/orpheus/deps
-        DEPS_VER="v7"
-        # Invalidate cache if stale torchcodec is present (bad v9 install)
-        [ -d $DEPS/torchcodec ] && rm -f $DEPS/.version && echo "[deps] Stale torchcodec — invalidating cache"
-        if ! [ -f $DEPS/.version ] || [ "$(cat $DEPS/.version)" != "$DEPS_VER" ]; then
-          echo "[deps] Installing $DEPS_VER …"
-          find $DEPS -mindepth 1 -delete 2>/dev/null; rm -rf $DEPS/torchcodec $DEPS/torchcodec* 2>/dev/null || true
-          mkdir -p $DEPS
-          pip install -q --target $DEPS \
-            --index-url https://pypi.org/simple/ soundfile einops jiwer
-          pip install -q --target $DEPS --no-deps \
-            --index-url https://pypi.org/simple/ "snac==1.2.1" openai-whisper
-          pip install -q --target $DEPS \
-            --index-url https://pypi.org/simple/ tiktoken more-itertools ffmpeg-python \
-            || echo "[warn] whisper runtime deps failed"
-          echo "$DEPS_VER" > $DEPS/.version
+        DEPS=/data/orpheus/deps-v2
+        DEPS_VER="v11"
+        mkdir -p $DEPS
+        if [ "${PET_NODE_RANK:-0}" = "0" ]; then
+          if ! [ -f $DEPS/.version ] || [ "$(cat $DEPS/.version)" != "$DEPS_VER" ]; then
+            echo "[deps] Node 0 installing $DEPS_VER into $DEPS …"
+            rm -rf "$DEPS"/*
+            pip install -q --target $DEPS \
+              --index-url https://pypi.org/simple/ \
+              "tiktoken>=0.5.0" soundfile librosa einops jiwer more-itertools ffmpeg-python
+            pip install -q --target $DEPS --no-deps \
+              --index-url https://pypi.org/simple/ \
+              "snac==1.2.1" openai-whisper peft
+            python3 -c "import sys; sys.path.insert(0,'$DEPS'); import tiktoken; assert hasattr(tiktoken,'Encoding')"
+            echo "$DEPS_VER" > $DEPS/.version
+            echo "[deps] Install verified."
+          fi
+        else
+          echo "[deps] Node ${PET_NODE_RANK} waiting for deps …"
+          until [ -f $DEPS/.version ] && [ "$(cat $DEPS/.version)" = "$DEPS_VER" ]; do sleep 5; done
         fi
-        export PYTHONPATH=$PYTHONPATH:$DEPS
+        export PYTHONPATH=$DEPS:$PYTHONPATH
 
         PREP_SENTINEL=/data/orpheus/checkpoints/preprocessed/.done
-        if [ ! -f $PREP_SENTINEL ]; then
-          echo "[preprocess] Node ${PET_NODE_RANK:-0}: processing shard (cap: $PREPROCESS_SAMPLES) …"
-          python3 /orpheus-scripts/train_orpheus.py --preprocess --force
-        fi
-        echo "[preprocess] Waiting for merged dataset (node ${PET_NODE_RANK:-0}) …"
+        echo "[preprocess] Waiting for dataset sentinel (node ${PET_NODE_RANK:-0}) …"
         until [ -f $PREP_SENTINEL ]; do sleep 10; done
         echo "[preprocess] Dataset ready — starting torchrun."
 
         torchrun /orpheus-scripts/train_orpheus.py
     env:
-      # ── Storage paths ────────────────────────────────────────────────────────
       - name: CHECKPOINT_DIR
-        value: /data/orpheus/checkpoints/turkish
+        value: /data/orpheus/checkpoints/turkish-v2
       - name: HF_HOME
         value: /data/orpheus/hf-cache
-
-      # ── Model / dataset ──────────────────────────────────────────────────────
       - name: BASE_MODEL
         value: "unsloth/orpheus-3b-0.1-pretrained"
       - name: HF_DATASET
         value: "afkfatih/turkish-tts-combined-raw"
-
-      # ── Training hyperparameters ──────────────────────────────────────────────
       - name: BATCH_SIZE
         value: "2"
       - name: GRAD_ACCUM
-        value: "4"           # effective global batch = 2×2×4 = 16
+        value: "4"
       - name: LEARNING_RATE
-        value: "1e-4"
+        value: "2e-5"
       - name: NUM_EPOCHS
-        value: "3"
+        value: "8"
       - name: MAX_SEQ_LEN
         value: "4096"
       - name: PREPROCESS_SAMPLES
-        value: "10000"       # tokenise first 10K samples; both nodes share the work
+        value: "20000"
       - name: MAX_TRAIN_SAMPLES
-        value: "2000"        # ~2 h smoke run from the preprocessed 10K pool
+        value: "20000"
       - name: SAVE_STEPS
-        value: "200"
+        value: "800"
       - name: LOGGING_STEPS
-        value: "5"
+        value: "10"
+      - name: EVAL_STEPS
+        value: "200"
       - name: AUDIO_LOG_STEPS
-        value: "50"        # smoke run: 1500 steps → 30 eval points; full run: bump to 200
+        value: "400"
+      - name: WARMUP_RATIO
+        value: "0.1"
+      - name: LORA_R
+        value: "32"
+      - name: LORA_ALPHA
+        value: "64"
+      - name: LORA_DROPOUT
+        value: "0.05"
       - name: WHISPER_MODEL
-        value: "small"     # small=fast in-training WER; large-v3 used in eval job
+        value: "small"
+      - name: MLFLOW_PLATFORM
+        value: "openshift-ai/kubeflow-trainer-v2/orpheus"
       - name: PYTHONUNBUFFERED
         value: "1"
       - name: TQDM_DISABLE
         value: "1"
-
-      # ── MLflow tracking ───────────────────────────────────────────────────────
       - name: MLFLOW_TRACKING_URI
         value: "https://rh-ai.apps.oai-kft-ibm.ibm.rh-ods.com/mlflow"
       - name: MLFLOW_TRACKING_INSECURE_TLS
@@ -113,8 +119,6 @@ spec:
           secretKeyRef:
             name: smartshop-mlflow-token
             key: MLFLOW_TRACKING_TOKEN
-
-      # ── GPU / runtime ─────────────────────────────────────────────────────────
       - name: PYTORCH_CUDA_ALLOC_CONF
         value: "expandable_segments:True"
       - name: NCCL_BUFFSIZE
@@ -129,8 +133,6 @@ spec:
         value: "1"
       - name: NCCL_DEBUG
         value: "WARN"
-
-      # ── HuggingFace token (from cluster secret) ───────────────────────────────
       - name: HF_TOKEN
         valueFrom:
           secretKeyRef:
@@ -156,7 +158,7 @@ spec:
         volumes:
           - name: data
             persistentVolumeClaim:
-              claimName: orpheus-tts-storage   # dedicated PVC — separate from MMS
+              claimName: orpheus-tts-storage
           - name: orpheus-scripts
             configMap:
               name: orpheus-tts-scripts

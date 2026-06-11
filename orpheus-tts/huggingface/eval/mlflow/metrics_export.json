@@ -1,0 +1,173 @@
+{
+  "training_run_id": "6804b44335f347849f26da2736aa73df",
+  "eval_run_id": "27568d2349204af9bf32882f0e8ad1f1",
+  "mlflow_experiment": "orpheus-turkish-tts",
+  "training": {
+    "eval_loss": {
+      "first": {
+        "key": "eval/loss",
+        "value": 9.503422737121582,
+        "timestamp": 1781077219595,
+        "step": 200
+      },
+      "last": {
+        "key": "eval/loss",
+        "value": 4.3454203605651855,
+        "timestamp": 1781095288707,
+        "step": 9400
+      },
+      "best": {
+        "key": "eval/loss",
+        "value": 4.345282077789307,
+        "timestamp": 1781094944252,
+        "step": 9200
+      }
+    },
+    "train_loss": {
+      "first": {
+        "key": "train/loss",
+        "value": 13.4878,
+        "timestamp": 1781076884604,
+        "step": 10
+      },
+      "last": {
+        "key": "train/loss",
+        "value": 4.3346,
+        "timestamp": 1781095436734,
+        "step": 9500
+      }
+    },
+    "wer_mean": {
+      "points": 24,
+      "best": {
+        "key": "wer/mean",
+        "value": 0.6738095238095237,
+        "timestamp": 1781091853560,
+        "step": 7600
+      }
+    },
+    "cer_mean": {
+      "points": 24,
+      "best": {
+        "key": "cer/mean",
+        "value": 0.29193973832637216,
+        "timestamp": 1781088803131,
+        "step": 6000
+      }
+    }
+  },
+  "post_train_eval": {
+    "aggregate": {
+      "baseline_wer_mean": 1.1083333333333332,
+      "finetuned_wer_mean": 0.9291666666666666,
+      "baseline_cer_mean": 0.8996962969925753,
+      "finetuned_cer_mean": 0.7865822990566526,
+      "baseline_rtf_mean": 13.647856934696318,
+      "finetuned_rtf_mean": 7.200695067731178,
+      "wer_improvement": 0.1791666666666668,
+      "cer_improvement": 0.1131139979359227
+    },
+    "per_sentence": [
+      {
+        "id": "flight_announce",
+        "label": "Flight",
+        "baseline_wer": 1.0,
+        "finetuned_wer": 1.0,
+        "baseline_cer": 0.896551724137931,
+        "finetuned_cer": 0.896551724137931,
+        "cer_delta": 0.0,
+        "wer_delta": 0.0
+      },
+      {
+        "id": "welcome",
+        "label": "Welcome",
+        "baseline_wer": 1.0,
+        "finetuned_wer": 0.6666666666666666,
+        "baseline_cer": 0.875,
+        "finetuned_cer": 0.4166666666666667,
+        "cer_delta": 0.4583333333333333,
+        "wer_delta": 0.33333333333333337
+      },
+      {
+        "id": "safety",
+        "label": "Safety",
+        "baseline_wer": 1.3333333333333333,
+        "finetuned_wer": 1.0,
+        "baseline_cer": 0.8135593220338984,
+        "finetuned_cer": 0.8983050847457628,
+        "cer_delta": -0.0847457627118644,
+        "wer_delta": 0.33333333333333326
+      },
+      {
+        "id": "farewell",
+        "label": "Farewell",
+        "baseline_wer": 1.0,
+        "finetuned_wer": 1.0,
+        "baseline_cer": 0.9024390243902439,
+        "finetuned_cer": 0.8780487804878049,
+        "cer_delta": 0.024390243902439046,
+        "wer_delta": 0.0
+      },
+      {
+        "id": "weather",
+        "label": "Weather",
+        "baseline_wer": 1.0,
+        "finetuned_wer": 1.0,
+        "baseline_cer": 1.0,
+        "finetuned_cer": 0.8723404255319149,
+        "cer_delta": 0.12765957446808507,
+        "wer_delta": 0.0
+      },
+      {
+        "id": "news_intro",
+        "label": "News",
+        "baseline_wer": 1.0,
+        "finetuned_wer": 0.875,
+        "baseline_cer": 0.8867924528301887,
+        "finetuned_cer": 0.6981132075471698,
+        "cer_delta": 0.18867924528301894,
+        "wer_delta": 0.125
+      },
+      {
+        "id": "directions",
+        "label": "Directions",
+        "baseline_wer": 1.0,
+        "finetuned_wer": 0.75,
+        "baseline_cer": 0.9333333333333333,
+        "finetuned_cer": 0.6,
+        "cer_delta": 0.33333333333333337,
+        "wer_delta": 0.25
+      },
+      {
+        "id": "question",
+        "label": "Question",
+        "baseline_wer": 1.75,
+        "finetuned_wer": 1.0,
+        "baseline_cer": 0.8378378378378378,
+        "finetuned_cer": 1.0,
+        "cer_delta": -0.16216216216216217,
+        "wer_delta": 0.75
+      },
+      {
+        "id": "tech",
+        "label": "Tech",
+        "baseline_wer": 1.0,
+        "finetuned_wer": 1.0,
+        "baseline_cer": 0.9166666666666666,
+        "finetuned_cer": 0.8666666666666667,
+        "cer_delta": 0.04999999999999993,
+        "wer_delta": 0.0
+      },
+      {
+        "id": "emergency",
+        "label": "Emergency",
+        "baseline_wer": 1.0,
+        "finetuned_wer": 1.0,
+        "baseline_cer": 0.9347826086956522,
+        "finetuned_cer": 0.7391304347826086,
+        "cer_delta": 0.19565217391304357,
+        "wer_delta": 0.0
+      }
+    ]
+  }
+}

@@ -38,10 +38,14 @@ def train(
     num_epochs:        int   = 3,
     save_steps:        int   = 200,
     logging_steps:     int   = 10,
+    eval_steps:        int   = 0,        # 0 = use audio_log_steps
     audio_log_steps:   int   = 100,
     eval_split:        float = 0.05,
+    warmup_ratio:      float = 0.05,
+    lora_r:            int   = 16,
+    lora_alpha:        int   = 32,
+    lora_dropout:      float = 0.05,
     mlflow_experiment: str   = "orpheus-turkish-tts",
-    register_model:    bool  = True,
     # Whisper model for in-training WER/CER — keep small/medium for speed.
     # large-v3 is used in the post-training eval job only.
     whisper_model:     str   = "small",
@@ -70,11 +74,11 @@ def train(
     log = logging.getLogger("train_orpheus")
 
     # ── Heavy ML imports ──────────────────────────────────────────────────────
-    import math
     import warnings
     import urllib3
     warnings.filterwarnings("ignore", category=urllib3.exceptions.InsecureRequestWarning)
 
+    import librosa
     import numpy as np
     import torch
     import mlflow
@@ -89,6 +93,7 @@ def train(
         TrainerCallback,
         TrainingArguments,
     )
+    from peft import LoraConfig, get_peft_model, TaskType
 
     # ── Constants (Orpheus / SNAC token spec) ─────────────────────────────────
     LLAMA_VOCAB    = 128_256
@@ -111,6 +116,14 @@ def train(
         ("farewell",        "teşekkür ederiz, iyi yolculuklar dileriz."),
     ]
 
+    GEN_MAX_NEW_TOKENS = int(os.environ.get("GEN_MAX_NEW_TOKENS", "1500"))
+    GEN_MIN_NEW_TOKENS = int(os.environ.get("GEN_MIN_NEW_TOKENS", "80"))
+    GEN_BASELINE_MAX_NEW_CAP = int(os.environ.get("GEN_BASELINE_MAX_NEW_CAP", "400"))
+    GEN_TEMPERATURE    = float(os.environ.get("GEN_TEMPERATURE", "0.3"))
+    GEN_TOP_P          = float(os.environ.get("GEN_TOP_P", "0.9"))
+    GEN_REPETITION_PENALTY = float(os.environ.get("GEN_REPETITION_PENALTY", "1.15"))
+    GEN_TRIM_TOP_DB    = float(os.environ.get("GEN_TRIM_TOP_DB", "28"))
+
     # ── Environment setup ─────────────────────────────────────────────────────
     os.environ["HF_HOME"]               = hf_cache
     os.environ["MLFLOW_EXPERIMENT_NAME"] = mlflow_experiment  # HF Trainer reads this
@@ -121,11 +134,47 @@ def train(
 
     # Filled after dataset load; consumed inside on_train_begin (run is active by then)
     _dataset_params: dict = {}
+    effective_eval_steps = eval_steps or audio_log_steps
 
     # ── Helper: build inference prompt ────────────────────────────────────────
     def build_prompt(tokenizer, text: str) -> list:
-        ids = tokenizer.encode(text, add_special_tokens=True) + [TOK_EOT]
+        # Match preprocess(): no BOS/EOS from tokenizer — header tokens added explicitly.
+        ids = tokenizer.encode(text, add_special_tokens=False) + [TOK_EOT]
         return [TOK_SOH] + ids + [TOK_EOH, TOK_SOA, TOK_SOS]
+
+    def _min_new_tokens_for(text: str) -> int:
+        mult = int(os.environ.get("GEN_MIN_TOKENS_PER_CHAR", "7"))
+        return min(
+            GEN_MAX_NEW_TOKENS - 50,
+            max(GEN_MIN_NEW_TOKENS, len(text) * mult),
+        )
+
+    def _generation_budget(text: str, *, baseline: bool) -> tuple[int, int]:
+        if baseline:
+            return GEN_MIN_NEW_TOKENS, min(GEN_MAX_NEW_TOKENS, GEN_BASELINE_MAX_NEW_CAP)
+        return _min_new_tokens_for(text), GEN_MAX_NEW_TOKENS
+
+    def _truncate_at_eoa(token_ids: list) -> list:
+        if TOK_EOA in token_ids:
+            return token_ids[: token_ids.index(TOK_EOA)]
+        return token_ids
+
+    def _clean_wav(wav: np.ndarray) -> np.ndarray:
+        """Trim edge silence only — keep full utterance including brief pauses."""
+        wav = wav.astype(np.float32)
+        try:
+            trimmed, _ = librosa.effects.trim(
+                wav, top_db=GEN_TRIM_TOP_DB, frame_length=2048, hop_length=512,
+            )
+            if len(trimmed) / SNAC_SR >= 0.1:
+                wav = trimmed
+        except Exception:
+            pass
+
+        peak = np.abs(wav).max()
+        if peak > 1e-6:
+            wav = wav * (0.9 / peak)
+        return wav.astype(np.float32)
 
     # ── Helper: decode SNAC audio tokens → waveform ───────────────────────────
     def snac_decode(snac_model, token_ids: list, device) -> Optional[np.ndarray]:
@@ -159,9 +208,12 @@ def train(
 
     # ── Helper: generate audio for one sentence ───────────────────────────────
     # Detect MLflow tracing support (requires MLflow >= 2.14)
-    _has_trace = hasattr(mlflow, "trace")
+    _has_trace = hasattr(mlflow, "start_span")
 
-    def generate_audio(model, tokenizer, snac_model, text: str, device, step: int = 0):
+    def generate_audio(
+        model, tokenizer, snac_model, text: str, device,
+        step: int = 0, *, baseline: bool = False,
+    ):
         """Returns (waveform_or_None, elapsed_seconds). Traced with sub-spans when MLflow supports it."""
 
         def _run(text):
@@ -171,22 +223,36 @@ def train(
             if _has_trace:
                 with mlflow.start_span(name="tokenise", span_type="PARSER") as sp:
                     prompt = build_prompt(tokenizer, text)
-                    sp.set_inputs({"text": text})
+                    sp.set_inputs({"text": text, "baseline": baseline})
                     sp.set_outputs({"n_tokens": len(prompt)})
             else:
                 prompt = build_prompt(tokenizer, text)
 
             inp = torch.tensor([prompt], dtype=torch.long, device=device)
+            min_new, max_new = _generation_budget(text, baseline=baseline)
 
             # ── span 2: model.generate ────────────────────────────────────────
             if _has_trace:
                 with mlflow.start_span(name="model_generate", span_type="LLM") as sp:
-                    sp.set_inputs({"prompt_tokens": len(prompt), "max_new_tokens": 1200,
-                                   "temperature": 0.7})
+                    sp.set_inputs({
+                        "prompt_tokens": len(prompt),
+                        "max_new_tokens": max_new,
+                        "min_new_tokens": min_new,
+                        "baseline": baseline,
+                        "temperature": GEN_TEMPERATURE,
+                        "top_p": GEN_TOP_P,
+                        "repetition_penalty": GEN_REPETITION_PENALTY,
+                    })
                     with torch.inference_mode():
                         out = model.generate(
-                            inp, max_new_tokens=1200, do_sample=True,
-                            temperature=0.7, repetition_penalty=1.1,
+                            inp,
+                            max_new_tokens=max_new,
+                            min_new_tokens=min_new,
+                            do_sample=True,
+                            temperature=GEN_TEMPERATURE,
+                            top_p=GEN_TOP_P,
+                            use_cache=True,
+                            repetition_penalty=GEN_REPETITION_PENALTY,
                             eos_token_id=TOK_EOA,
                         )
                     new_tokens = len(out[0]) - len(prompt)
@@ -194,22 +260,30 @@ def train(
             else:
                 with torch.inference_mode():
                     out = model.generate(
-                        inp, max_new_tokens=1200, do_sample=True,
-                        temperature=0.7, repetition_penalty=1.1,
+                        inp,
+                        max_new_tokens=max_new,
+                        min_new_tokens=min_new,
+                        do_sample=True,
+                        temperature=GEN_TEMPERATURE,
+                        top_p=GEN_TOP_P,
+                        use_cache=True,
+                        repetition_penalty=GEN_REPETITION_PENALTY,
                         eos_token_id=TOK_EOA,
                     )
+
+            new_ids = _truncate_at_eoa(out[0][len(prompt) :].cpu().tolist())
 
             # ── span 3: SNAC decode ───────────────────────────────────────────
             if _has_trace:
                 with mlflow.start_span(name="snac_decode", span_type="RETRIEVER") as sp:
-                    sp.set_inputs({"audio_tokens": len(out[0]) - len(prompt)})
-                    wav = snac_decode(snac_model, out[0][len(prompt):].cpu().tolist(), device)
+                    sp.set_inputs({"audio_tokens": len(new_ids)})
+                    wav = snac_decode(snac_model, new_ids, device)
                     duration = len(wav) / SNAC_SR if wav is not None else 0.0
                     sp.set_outputs({"duration_s": round(duration, 3),
                                     "sample_rate": SNAC_SR,
                                     "samples": len(wav) if wav is not None else 0})
             else:
-                wav = snac_decode(snac_model, out[0][len(prompt):].cpu().tolist(), device)
+                wav = snac_decode(snac_model, new_ids, device)
 
             elapsed = time.perf_counter() - t0
 
@@ -217,7 +291,7 @@ def train(
                 duration = len(wav) / SNAC_SR
                 rtf = elapsed / max(duration, 1e-6)
                 try:
-                    mlflow.log_metric("rtf_latest", rtf)
+                    mlflow.log_metric("rtf_latest", rtf, step=step)
                 except Exception:
                     pass
                 # Return structured summary as trace output (not raw floats)
@@ -263,7 +337,7 @@ def train(
 
     # ── Helper: log audio batch + quality metrics to MLflow ───────────────────
     def log_audio_batch(model, tokenizer, snac_model, device, step: int, folder: str,
-                        whisper_mdl=None, utmos_mdl=None):
+                        whisper_mdl=None, utmos_mdl=None, *, baseline: bool = False):
         model.eval()
         metrics = {}
         tmp = Path(tempfile.mkdtemp())
@@ -271,12 +345,21 @@ def train(
         wers, cers, utmos_scores, rtfs = [], [], [], []
 
         for label, text in EVAL_SENTENCES:
-            wav, elapsed = generate_audio(model, tokenizer, snac_model, text, device, step=step)
+            wav, elapsed = generate_audio(
+                model, tokenizer, snac_model, text, device, step=step, baseline=baseline,
+            )
             if wav is None:
                 log.warning(f"No audio for '{label}' at step {step}")
                 continue
 
             duration = len(wav) / SNAC_SR
+            if duration < 0.3:
+                log.warning(f"Audio too short ({duration:.2f}s) for '{label}' at step {step} — skipping")
+                continue
+
+            wav = _clean_wav(wav)
+            duration = len(wav) / SNAC_SR
+
             rtf = elapsed / max(duration, 1e-6)
             rtfs.append(rtf)
             metrics[f"rtf/{label}"] = rtf
@@ -380,6 +463,9 @@ def train(
             # Active MLflow run guaranteed here — HF Trainer's MLflowCallback
             # runs before user callbacks and creates the run in its on_train_begin.
             world = int(os.environ.get("WORLD_SIZE", "1"))
+            platform = os.environ.get(
+                "MLFLOW_PLATFORM", "openshift-ai/kubeflow-trainer-v2"
+            )
             mlflow.set_tags({
                 "base_model":      base_model,
                 "dataset":         hf_dataset,
@@ -388,11 +474,34 @@ def train(
                 "n_gpus":          str(torch.cuda.device_count() * world),
                 "gpu":             torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
                 "effective_batch": str(batch_size * grad_accum * world),
-                "platform":        "openshift-ai/kubeflow-trainer-v2",
+                "platform":        platform,
             })
             # Log dataset stats now that a run is active
             if _dataset_params:
                 mlflow.log_params(_dataset_params)
+            mlflow.log_params({
+                "lora_r": lora_r,
+                "lora_alpha": lora_alpha,
+                "lora_dropout": lora_dropout,
+                "lora_target_modules": "q/k/v/o/gate/up/down_proj",
+                "trainable_params_M": round(trainable / 1e6, 1),
+                "total_params_B": round(total / 1e9, 2),
+                "learning_rate": learning_rate,
+                "num_epochs": num_epochs,
+                "batch_size": batch_size,
+                "grad_accum_steps": grad_accum,
+                "eval_steps": effective_eval_steps,
+                "audio_log_steps": audio_log_steps,
+                "lr_scheduler": "cosine",
+                "warmup_ratio": warmup_ratio,
+                "weight_decay": 0.01,
+                "eval_gen_temperature": GEN_TEMPERATURE,
+                "eval_gen_top_p": GEN_TOP_P,
+                "eval_gen_max_new_tokens": GEN_MAX_NEW_TOKENS,
+                "eval_gen_min_new_tokens": GEN_MIN_NEW_TOKENS,
+                "eval_gen_repetition_penalty": GEN_REPETITION_PENALTY,
+                "eval_gen_trim_top_db": GEN_TRIM_TOP_DB,
+            })
 
             log.info("Logging pretrained baseline audio + metrics …")
             try:
@@ -401,6 +510,7 @@ def train(
                     step=0, folder="audio/step_000000/pretrained_baseline",
                     whisper_mdl=self._get_whisper(),
                     utmos_mdl=self._get_utmos(),
+                    baseline=True,
                 )
             except Exception as e:
                 log.warning(f"Baseline audio failed: {e}")
@@ -408,16 +518,25 @@ def train(
         def on_log(self, args, state, control, logs=None, **kwargs):
             if not state.is_world_process_zero or not logs:
                 return
-            for key in ("loss", "eval_loss"):
+            step = state.global_step
+            for key, alias in (("loss", "train/loss"), ("eval_loss", "eval/loss")):
                 if key in logs:
                     try:
+                        v = logs[key]
+                        mlflow.log_metric(alias, v, step=step)
                         mlflow.log_metric(
-                            key.replace("loss", "perplexity"),
-                            math.exp(min(logs[key], 10)),
-                            step=state.global_step,
+                            alias.replace("loss", "perplexity"),
+                            math.exp(min(v, 10)),
+                            step=step,
                         )
                     except Exception:
                         pass
+            # Pass through learning_rate trend
+            if "learning_rate" in logs:
+                try:
+                    mlflow.log_metric("train/lr", logs["learning_rate"], step=step)
+                except Exception:
+                    pass
 
         def on_step_end(self, args, state, control, model=None, **kwargs):
             if not state.is_world_process_zero:
@@ -451,20 +570,12 @@ def train(
                             str(p),
                             artifact_path=f"checkpoints/step_{step:06d}",
                         )
-                run_id = mlflow.active_run().info.run_id
-                mv = mlflow.register_model(
-                    f"runs:/{run_id}/checkpoints/step_{step:06d}",
-                    "orpheus-turkish-tts",
-                )
-                mlflow.MlflowClient().set_model_version_tag(
-                    "orpheus-turkish-tts", mv.version,
-                    "training_step", str(step),
-                )
-                mlflow.MlflowClient().set_model_version_tag(
-                    "orpheus-turkish-tts", mv.version,
-                    "checkpoint_pvc_path", str(ckpt_path),
-                )
-                log.info(f"Registered checkpoint v{mv.version} at step {step}")
+                mlflow.set_tags({
+                    f"ckpt_step_{step:06d}": str(ckpt_path),
+                    "latest_checkpoint": str(ckpt_path),
+                    "latest_checkpoint_step": str(step),
+                })
+                log.info(f"Checkpoint tagged in MLflow: step_{step:06d} → {ckpt_path}")
             except Exception as e:
                 log.warning(f"Checkpoint registration failed at step {step}: {e}")
 
@@ -481,8 +592,7 @@ def train(
                 )
             except Exception as e:
                 log.warning(f"Final audio failed: {e}")
-            # Model artifact logging + registration happens after trainer.train()
-            # returns so the artifact exists before register_model is called.
+            # Final model save happens after trainer.train() returns.
 
     # ── Load tokenizer + model ────────────────────────────────────────────────
     log.info(f"Loading model: {base_model}")
@@ -495,7 +605,21 @@ def train(
         torch_dtype=torch.bfloat16,
         attn_implementation="flash_attention_2",
     )
-    log.info(f"Parameters: {model.num_parameters() / 1e9:.2f}B")
+    total_params = model.num_parameters()
+
+    lora_cfg = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        r=lora_r,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        bias="none",
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                        "gate_proj", "up_proj", "down_proj"],
+    )
+    model = get_peft_model(model, lora_cfg)
+    trainable, total = model.get_nb_trainable_parameters()
+    log.info(f"LoRA: {trainable/1e6:.1f}M trainable / {total/1e9:.2f}B total "
+             f"({100*trainable/total:.2f}% of params)")
 
     # ── Load dataset (preprocessed by preprocess_orpheus.py, run pre-torchrun) ─
     preprocessed_dir = Path(checkpoint_dir).parent / "preprocessed"
@@ -511,6 +635,19 @@ def train(
 
     if max_samples:
         ds = ds.select(range(min(max_samples, len(ds))))
+
+    def _audio_only_labels(example):
+        """Mask prompt tokens so loss is computed on audio tokens only."""
+        ids = example["input_ids"]
+        try:
+            sos_idx = ids.index(TOK_SOS)
+        except ValueError:
+            example["labels"] = list(ids)
+            return example
+        example["labels"] = [-100] * (sos_idx + 1) + ids[sos_idx + 1:]
+        return example
+
+    ds = ds.map(_audio_only_labels)
 
     before = len(ds)
     ds = ds.filter(lambda x: len(x["input_ids"]) <= max_seq_len)
@@ -547,11 +684,12 @@ def train(
         gradient_accumulation_steps=grad_accum,
         learning_rate=learning_rate,
         lr_scheduler_type="cosine",
-        warmup_ratio=0.05,
+        warmup_ratio=warmup_ratio,
+        weight_decay=0.01,
         bf16=True,
         tf32=True,
         logging_steps=logging_steps,
-        eval_steps=audio_log_steps,
+        eval_steps=effective_eval_steps,
         eval_strategy="steps",
         save_steps=save_steps,
         save_total_limit=3,
@@ -595,22 +733,11 @@ def train(
 
         mlflow.set_tag("checkpoint_path", str(final))
 
-        # Register in Model Registry now that the artifact batch is logged
-        if register_model:
-            try:
-                run_id = mlflow.active_run().info.run_id
-                # Register pointing at the metadata artifact path
-                mv = mlflow.register_model(
-                    f"runs:/{run_id}/model_metadata",
-                    "orpheus-turkish-tts",
-                )
-                mlflow.MlflowClient().set_model_version_tag(
-                    "orpheus-turkish-tts", mv.version,
-                    "stage", "final",
-                )
-                log.info(f"Registered final model: orpheus-turkish-tts v{mv.version}")
-            except Exception as e:
-                log.warning(f"Model registration failed (non-critical): {e}")
+        mlflow.set_tags({
+            "final_checkpoint_path": str(final),
+            "stage": "final",
+        })
+        log.info(f"Final model tagged in MLflow: {final}")
 
 
 # ── CLI entry point ───────────────────────────────────────────────────────────
@@ -713,7 +840,13 @@ def preprocess(
             seq = ([TOK_SOH] + t_ids + [TOK_EOT, TOK_EOH, TOK_SOA, TOK_SOS]
                    + _interleave(l0, l1, l2) + [TOK_EOA])
             if len(seq) > max_seq_len: skipped += 1; continue
-            rows.append({"input_ids": seq, "labels": seq, "attention_mask": [1]*len(seq)})
+            sos_idx = seq.index(TOK_SOS)
+            labels = [-100] * (sos_idx + 1) + seq[sos_idx + 1:]
+            rows.append({
+                "input_ids": seq,
+                "labels": labels,
+                "attention_mask": [1] * len(seq),
+            })
         except Exception as e:
             log.warning("node%d sample %d skipped: %s", node_rank, i, e); skipped += 1
 
@@ -773,9 +906,13 @@ if __name__ == "__main__":
         num_epochs        = _e("NUM_EPOCHS",        3,     int),
         save_steps        = _e("SAVE_STEPS",        200,   int),
         logging_steps     = _e("LOGGING_STEPS",     10,    int),
+        eval_steps        = _e("EVAL_STEPS",        0,     int),
         audio_log_steps   = _e("AUDIO_LOG_STEPS",   100,   int),
         eval_split        = _e("EVAL_SPLIT",        0.05,  float),
+        warmup_ratio      = _e("WARMUP_RATIO",      0.05,  float),
+        lora_r            = _e("LORA_R",            16,    int),
+        lora_alpha        = _e("LORA_ALPHA",        32,    int),
+        lora_dropout      = _e("LORA_DROPOUT",      0.05,  float),
         mlflow_experiment = _e("MLFLOW_EXPERIMENT", "orpheus-turkish-tts"),
-        register_model    = _e("REGISTER_MODEL",    "true").lower() == "true",
         whisper_model     = _e("WHISPER_MODEL",     "small"),
     )

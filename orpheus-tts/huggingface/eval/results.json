@@ -1,0 +1,79 @@
+{
+  "model": "AbDhumal/orpheus-3b-turkish-tts-v2",
+  "base_model": "unsloth/orpheus-3b-0.1-pretrained",
+  "checkpoint_source": "/data/orpheus/checkpoints/turkish-v2/final",
+  "merged_from": "checkpoint-8800",
+  "language": "tr",
+  "eval_protocol": {
+    "asr_model": "openai-whisper-small",
+    "asr_language": "tr",
+    "metrics": ["wer", "cer", "rtf"],
+    "generation": {
+      "max_new_tokens": 1500,
+      "min_new_tokens": 80,
+      "min_tokens_per_char": 7,
+      "baseline_max_new_cap": 400,
+      "temperature": 0.3,
+      "top_p": 0.9,
+      "repetition_penalty": 1.15,
+      "trim_top_db": 35
+    },
+    "codec": "hubertsiuzdak/snac_24khz",
+    "sample_rate_hz": 24000
+  },
+  "eval_sets": {
+    "in_training_monitoring": {
+      "description": "4 airline-domain prompts logged every AUDIO_LOG_STEPS during training (Whisper-small)",
+      "mlflow_run_id": "6804b44335f347849f26da2736aa73df",
+      "sentences": ["flight_announce", "welcome", "safety", "farewell"],
+      "best_per_sentence": {
+        "welcome": {"cer": 0.0417, "wer": 0.3333, "step": 6000},
+        "flight_announce": {"cer": 0.2241, "wer": 0.2857, "step": 7200},
+        "farewell": {"cer": 0.1951, "wer": 0.6, "step": 8400},
+        "safety": {"cer": 0.4746, "wer": 0.5, "step": 8000}
+      },
+      "best_mean": {"cer": 0.2919, "step": 6000}
+    },
+    "post_train_eval_v4": {
+      "description": "10-sentence eval on merged final/ weights — baseline cap max_new_tokens=400",
+      "output_dir": "/data/orpheus/eval-v4-final",
+      "mlflow_run_id": "50c177d696164b4a83169292b2109b4e",
+      "mlflow_run_name": "eval-orpheus-tr-final",
+      "finetuned_checkpoint": "final",
+      "aggregate": {
+        "baseline": {"wer_mean": 1.576, "cer_mean": 1.224, "rtf_mean": 2.136},
+        "finetuned": {"wer_mean": 0.723, "cer_mean": 0.410, "rtf_mean": 2.226},
+        "delta": {"wer": 0.854, "cer": 0.814}
+      },
+      "per_sentence": [
+        {"id": "flight_announce", "reference": "sayın yolcularımız, uçuşumuz yaklaşık iki saat sürecektir.", "baseline": {"wer": 1.429, "cer": 0.879}, "finetuned": {"wer": 0.286, "cer": 0.190}},
+        {"id": "welcome", "reference": "istanbul'a hoş geldiniz.", "baseline": {"wer": 3.333, "cer": 2.792}, "finetuned": {"wer": 0.667, "cer": 0.125}},
+        {"id": "safety", "reference": "güvenlik nedeniyle elektronik cihazlarınızı kapalı tutunuz.", "baseline": {"wer": null, "cer": null}, "finetuned": {"wer": null, "cer": null}, "note": "excluded from HF audio (finetuned worse than baseline)"},
+        {"id": "farewell", "reference": "teşekkür ederiz, iyi yolculuklar dileriz.", "baseline": {"wer": 1.0, "cer": 0.780}, "finetuned": {"wer": 0.6, "cer": 0.293}},
+        {"id": "weather", "reference": "bugün istanbul'da hava bulutlu ve serin olacak.", "baseline": {"wer": 1.0, "cer": 0.894}, "finetuned": {"wer": 0.857, "cer": 0.277}},
+        {"id": "news_intro", "reference": "ana haberlere geçmeden önce önemli bir duyurumuz var.", "baseline": {"wer": 1.75, "cer": 1.491}, "finetuned": {"wer": 0.375, "cer": 0.151}},
+        {"id": "directions", "reference": "düz gidin, sonra sağa dönün ve köprüyü geçin.", "baseline": {"wer": 2.0, "cer": 1.556}, "finetuned": {"wer": 0.5, "cer": 0.222}},
+        {"id": "question", "reference": "yarın toplantıya katılabilir misiniz?", "baseline": {"wer": 2.25, "cer": 1.243}, "finetuned": {"wer": 0.75, "cer": 0.514}},
+        {"id": "tech", "reference": "yapay zeka teknolojisi her geçen gün gelişmeye devam ediyor.", "baseline": {"wer": 1.0, "cer": 0.9}, "finetuned": {"wer": 0.667, "cer": 0.433}},
+        {"id": "emergency", "reference": "acil durum! lütfen binayı derhal tahliye edin.", "baseline": {"wer": 1.0, "cer": 0.826}, "finetuned": {"wer": 0.857, "cer": 0.609}}
+      ],
+      "hf_curated_phrases": 9,
+      "hf_excluded": ["safety"]
+    }
+  },
+  "training_summary": {
+    "platform": "Red Hat OpenShift AI / Kubeflow Trainer v2",
+    "mlflow_run_id": "6804b44335f347849f26da2736aa73df",
+    "trainjob": "orpheus-turkish-tts-v2",
+    "epochs": 8,
+    "global_steps": 9504,
+    "train_samples": 20000,
+    "lora_r": 32,
+    "lora_alpha": 64,
+    "learning_rate": 2e-5,
+    "eval_loss_best": 4.3461,
+    "eval_loss_final": 4.3454,
+    "train_loss_final": 4.3346,
+    "hardware": "2 nodes x NVIDIA A100 80GB, DDP"
+  }
+}

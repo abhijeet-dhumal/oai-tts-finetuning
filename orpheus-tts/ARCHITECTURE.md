@@ -70,7 +70,7 @@ Cross-entropy over predicted vs. ground-truth SNAC tokens at each audio position
 
 ### Optimiser
 
-AdamW, `lr=1e-4`, cosine decay, warmup ratio 0.05. `torch.bfloat16` for all model weights and activations (A100 native).
+AdamW, `lr=2e-5` (v2), cosine decay, warmup ratio 0.1. LoRA r=32, α=64, dropout 0.05. `torch.bfloat16` + Flash Attention 2 on A100.
 
 ### Effective batch size
 
@@ -124,29 +124,29 @@ Both nodes then wait for `.done` before `torchrun` starts. On restart the sentin
 │  │    train_orpheus.py        │   │    train_orpheus.py        │     │
 │  │    (logs + MLflow)         │   │    (silent DDP worker)     │     │
 │  └────────────┬───────────────┘   └────────────┬───────────────┘     │
-│               └──────────────┬─────────────────┘                    │
+│               └──────────────┬─────────────────┘                     │
 │                              │ shared PVC (orpheus-tts-storage 150Gi)│
-│               ┌──────────────▼──────────────┐                       │
+│               ┌──────────────▼──────────────┐                        │
 │               │  /data/orpheus/              │                       │
-│               │  ├─ hf-cache/               │  model + SNAC weights │
-│               │  ├─ deps/                   │  pip-installed pkgs   │
-│               │  └─ checkpoints/            │                       │
-│               │      ├─ preprocessed/       │  Arrow dataset        │
-│               │      ├─ turkish/            │  HF Trainer ckpts     │
-│               │      └─ turkish/final/      │  safetensors weights  │
-│               └─────────────────────────────┘                       │
+│               │  ├─ hf-cache/               │  model + SNAC weights  │
+│               │  ├─ deps/                   │  pip-installed pkgs    │
+│               │  └─ checkpoints/            │                        │
+│               │      ├─ preprocessed/       │  Arrow dataset         │
+│               │      ├─ turkish-v2/          │  HF Trainer ckpts (v2) │
+│               │      └─ turkish-v2/final/     │  merged safetensors    │
+│               └─────────────────────────────┘                        │
 │                                                                      │
 │  Kubeflow Trainer v2 operator                                        │
 │  · Provisions pods + headless service for DNS rendezvous             │
-│  · Injects PET_MASTER_ADDR / PET_NODE_RANK / PET_NNODES —           │
+│  · Injects PET_MASTER_ADDR / PET_NODE_RANK / PET_NNODES —            │
 │    consumed natively by torchrun                                     │
 │  · Kueue ClusterQueue enforces GPU quota per namespace               │
 │                                                                      │
 │  MLflow (managed instance)                                           │
-│  · Metrics per step: loss, perplexity, wer/*, cer/*, rtf/*          │
-│  · Audio + spectrogram artifacts every AUDIO_LOG_STEPS              │
-│  · Traces: tokenise → model_generate → snac_decode per inference    │
-│  · Model Registry: checkpoint version per SAVE_STEPS                │
+│  · Metrics per step: loss, perplexity, wer/*, cer/*, rtf/*           │
+│  · Audio + spectrogram artifacts every AUDIO_LOG_STEPS               │
+│  · Traces: tokenise → model_generate → snac_decode per inference     │
+│  · Model Registry: checkpoint version per SAVE_STEPS                 │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 

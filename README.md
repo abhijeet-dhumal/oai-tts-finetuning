@@ -15,7 +15,7 @@ Fine-tunes **Orpheus-3B** — a codec language model (Llama-3 backbone) that gen
 - **Training:** Causal LM cross-entropy, DDP across 2× A100-80GB
 - **Preprocessing:** Distributed SNAC tokenization (5K samples/node in parallel)
 
-→ [README](./orpheus-tts/README.md) · [Architecture](./orpheus-tts/ARCHITECTURE.md)
+→ [README](./orpheus-tts/README.md) · [Architecture](./orpheus-tts/ARCHITECTURE.md) · [HF model](https://huggingface.co/AbDhumal/orpheus-3b-turkish-tts-v2)
 
 ---
 
@@ -49,10 +49,10 @@ Both examples share the same Kubeflow Trainer v2 pattern:
 
 ```bash
 # Orpheus TTS
-cd examples/tts-finetuning/orpheus-tts
+cd orpheus-tts
 kubectl kustomize . | oc apply -f - -n smartshop
 
 # VITS / MMS TTS
-cd examples/tts-finetuning/vits-tts
+cd vits-tts
 kubectl kustomize . | oc apply -f - -n smartshop
 ```

@@ -1,0 +1,110 @@
+# Publish artifacts to Hugging Face Hub (one-shot Job).
+#
+# Setup:
+#   oc create configmap orpheus-hf-card -n <namespace> \
+#     --from-file=hf-README.md=huggingface/README.md \
+#     --from-file=results.json=huggingface/eval/results.json \
+#     --dry-run=client -o yaml | oc apply -f -
+#
+# Modes (env UPLOAD_MODE):
+#   eval   — curated eval audio + metrics + README (default)
+#   full   — eval + merged weights from MODEL_DIR
+#   readme — README only
+#
+#   oc apply -f manifests/job-hf-upload.yaml -n <namespace>
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: orpheus-hf-upload
+  namespace: smartshop
+  labels:
+    kueue.x-k8s.io/queue-name: smartshop-training
+spec:
+  ttlSecondsAfterFinished: 600
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: smartshop-training
+      containers:
+        - name: upload
+          image: registry.access.redhat.com/ubi9/python-312:latest
+          command:
+            - bash
+            - -c
+            - |
+              set -euo pipefail
+              MODE="${UPLOAD_MODE:-eval}"
+              EVAL_SRC="${EVAL_SRC:-/data/orpheus/eval-v4-final}"
+              STAGING=/data/orpheus/hf-staging/eval
+              MODEL_DIR="${MODEL_DIR:-/data/orpheus/checkpoints/turkish-v2/final}"
+
+              if [ "$MODE" = "readme" ]; then
+                pip install -q huggingface_hub
+                export README_PATH=/hf-card/hf-README.md
+                python /orpheus-scripts/upload_to_hf.py --readme-only
+                exit 0
+              fi
+
+              pip install -q huggingface_hub soundfile
+              if [ ! -f "$EVAL_SRC/eval_results.json" ]; then
+                echo "ERROR: $EVAL_SRC/eval_results.json not found — run trainjob-orpheus-eval.yaml first"
+                exit 1
+              fi
+
+              rm -rf "$STAGING/audio"
+              mkdir -p "$STAGING"
+              cp "$EVAL_SRC/eval_results.json" "$STAGING/"
+              cp "$EVAL_SRC/eval_summary.csv" "$STAGING/" 2>/dev/null || true
+              cp /hf-card/results.json "$STAGING/" 2>/dev/null || true
+
+              python /orpheus-scripts/stage_hf_samples.py \
+                --eval-dir "$EVAL_SRC" \
+                --out-dir "$STAGING" \
+                --min-cer-delta "${HF_MIN_CER_DELTA:-0.05}" \
+                --min-duration-s "${HF_MIN_DURATION_S:-1.5}" \
+                --max-finetuned-cer "${HF_MAX_FINETUNED_CER:-0.85}"
+
+              export EVAL_DIR="$STAGING"
+              export README_PATH=/hf-card/hf-README.md
+              export MODEL_DIR
+
+              if [ "$MODE" = "full" ]; then
+                python /orpheus-scripts/upload_to_hf.py --prune-audio
+              else
+                python /orpheus-scripts/upload_to_hf.py --eval-only --prune-audio
+              fi
+
+              echo "=== Included phrases ==="
+              cat "$STAGING/included_phrases.json"
+          env:
+            - name: UPLOAD_MODE
+              value: "eval"
+            - name: EVAL_SRC
+              value: /data/orpheus/eval-v4-final
+            - name: HF_REPO_ID
+              value: AbDhumal/orpheus-3b-turkish-tts-v2
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-credentials
+                  key: token
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: scripts
+              mountPath: /orpheus-scripts
+            - name: hf-card
+              mountPath: /hf-card
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: orpheus-tts-storage
+        - name: scripts
+          configMap:
+            name: orpheus-tts-scripts
+            defaultMode: 0755
+        - name: hf-card
+          configMap:
+            name: orpheus-hf-card

@@ -5,14 +5,19 @@ namespace: smartshop
 
 resources:
   - manifests/pvc.yaml
-  - manifests/trainjob-orpheus.yaml
-  # trainjob-orpheus-eval.yaml is applied manually after training completes:
+  # Apply after reviewing env vars:
+  #   oc apply -f manifests/trainjob-orpheus.yaml
   #   oc apply -f manifests/trainjob-orpheus-eval.yaml
+  #   oc apply -f manifests/job-hf-upload.yaml
 
 configMapGenerator:
   - name: orpheus-tts-scripts
     files:
       - train_orpheus.py=scripts/train_orpheus.py
       - evaluate_orpheus.py=scripts/evaluate_orpheus.py
+      - save_final_orpheus.py=scripts/save_final_orpheus.py
+      - stage_hf_samples.py=scripts/stage_hf_samples.py
+      - upload_to_hf.py=scripts/upload_to_hf.py
+      - export_mlflow_snapshots.py=scripts/export_mlflow_snapshots.py
     options:
       disableNameSuffixHash: true

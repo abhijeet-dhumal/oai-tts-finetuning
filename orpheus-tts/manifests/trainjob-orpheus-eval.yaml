@@ -14,7 +14,7 @@ spec:
     kind: ClusterTrainingRuntime
     name: torch-distributed-cuda130-torch210-py312
   trainer:
-    numNodes: 1             # eval runs on a single node
+    numNodes: 1
     numProcPerNode: "gpu"
     resourcesPerNode:
       requests:
@@ -29,26 +29,34 @@ spec:
       - bash
       - -c
       - |
-        mkdir -p /tmp/deps
-        pip install -q --target /tmp/deps \
-          "transformers>=4.44.0,<5.0.0" "datasets>=3.0" \
-          "git+https://github.com/hubertsiuzdak/snac.git" \
-          soundfile mlflow openai-whisper jiwer pandas matplotlib utmos
-        export PYTHONPATH=/tmp/deps:$PYTHONPATH
+        set -euo pipefail
+        DEPS=/data/orpheus/deps-v2
+        export PYTHONPATH=$DEPS:${PYTHONPATH:-}
+
+        FINAL=/data/orpheus/checkpoints/turkish-v2/final
+        if [ ! -f "$FINAL/model.safetensors.index.json" ]; then
+          echo "ERROR: $FINAL not found — run save_final_orpheus.py first"
+          exit 1
+        fi
+
+        echo "=== Post-training eval on merged final/ (from checkpoint-8800) ==="
+        FINETUNED_MODEL="$FINAL" \
         python /orpheus-scripts/evaluate_orpheus.py
     env:
-      - name: FINETUNED_MODEL
-        value: /data/orpheus/checkpoints/turkish/final
       - name: BASE_MODEL
-        value: "canopylabs/orpheus-tts-0.1-pretrained"
+        value: "unsloth/orpheus-3b-0.1-pretrained"
       - name: HF_HOME
         value: /data/orpheus/hf-cache
       - name: WHISPER_MODEL
-        value: "large-v3"
+        value: "small"
       - name: EVAL_OUTPUT_DIR
-        value: /data/orpheus/eval
+        value: /data/orpheus/eval-v4-final
+      - name: SKIP_MLFLOW_ARTIFACTS
+        value: "1"
+      - name: MLFLOW_RUN_NAME
+        value: eval-orpheus-tr-final
       - name: MLFLOW_RUN_ID
-        value: ""         # leave blank to create a new eval run, or paste training run ID
+        value: ""
       - name: MLFLOW_EXPERIMENT
         value: orpheus-turkish-tts
       - name: MLFLOW_TRACKING_URI
@@ -57,6 +65,27 @@ spec:
         value: "kubernetes-namespaced"
       - name: MLFLOW_TRACKING_INSECURE_TLS
         value: "true"
+      - name: MLFLOW_TRACKING_TOKEN
+        valueFrom:
+          secretKeyRef:
+            name: smartshop-mlflow-token
+            key: MLFLOW_TRACKING_TOKEN
+      - name: GEN_MAX_NEW_TOKENS
+        value: "1500"
+      - name: GEN_MIN_NEW_TOKENS
+        value: "80"
+      - name: GEN_TEMPERATURE
+        value: "0.3"
+      - name: GEN_TOP_P
+        value: "0.9"
+      - name: GEN_REPETITION_PENALTY
+        value: "1.15"
+      - name: GEN_TRIM_TOP_DB
+        value: "35"
+      - name: GEN_MIN_TOKENS_PER_CHAR
+        value: "7"
+      - name: GEN_BASELINE_MAX_NEW_CAP
+        value: "400"
       - name: PYTORCH_CUDA_ALLOC_CONF
         value: "expandable_segments:True"
       - name: HF_TOKEN
