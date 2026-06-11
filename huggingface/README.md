@@ -76,7 +76,7 @@ Orpheus frames TTS as **causal LM over SNAC audio tokens**: Turkish text → con
 
 ## How this model was trained
 
-End-to-end pipeline (reproducible from [GitHub manifests](https://github.com/abhijeet-dhumal/oai-tts-finetuning)):
+End-to-end pipeline (reproducible from [GitHub manifests](https://github.com/abhijeet-dhumal/oai-tts-finetuning/tree/main/orpheus-tts)):
 
 | Step | What | Config / script |
 |------|------|-----------------|
@@ -177,10 +177,24 @@ MLflow: `orpheus-turkish-tts` · train `6804b44335f347849f26da2736aa73df` · eva
 
 > **Baseline comparison:** Audio labeled **B** is [`unsloth/orpheus-3b-0.1-pretrained`](https://huggingface.co/unsloth/orpheus-3b-0.1-pretrained) (English-pretrained) given the same Turkish text and generation settings. **F** is this checkpoint. Baseline WER/CER vs Turkish references are included for completeness — listen to the pairs below for perceptual comparison.
 
+### MLflow UI (training run)
+
+**Traces** — per-inference span breakdown (`tokenise` → `model_generate` → `snac_decode`) with RTF and duration:
+
+<img src="https://huggingface.co/AbDhumal/orpheus-3b-turkish-tts-v2/resolve/main/eval/mlflow/ui_traces_pipeline.png" width="100%"/>
+
+**Artifacts** — step-indexed WAV + spectrograms browsable in the MLflow UI (example: `flight_announce` @ step 8800):
+
+<img src="https://huggingface.co/AbDhumal/orpheus-3b-turkish-tts-v2/resolve/main/eval/mlflow/ui_artifacts_audio.png" width="100%"/>
+
+### Exported metric charts
+
 <img src="https://huggingface.co/AbDhumal/orpheus-3b-turkish-tts-v2/resolve/main/eval/mlflow/dashboard.png" width="100%"/>
 
 | Chart | Description |
 |-------|-------------|
+| [ui_traces_pipeline](eval/mlflow/ui_traces_pipeline.png) | MLflow Traces — pipeline spans + RTF |
+| [ui_artifacts_audio](eval/mlflow/ui_artifacts_audio.png) | MLflow Artifacts — in-train audio browser |
 | [dashboard](eval/mlflow/dashboard.png) | Training loss + in-train WER/CER + eval summary |
 | [eval_wer_cer_bars](eval/mlflow/eval_wer_cer_bars.png) | Per-sentence WER/CER |
 | [training_loss](eval/mlflow/training_loss.png) | train/eval loss curve |
@@ -290,7 +304,7 @@ out = model.generate(torch.tensor([prompt]).cuda(), max_new_tokens=1500, min_new
 
 ```bash
 git clone https://github.com/abhijeet-dhumal/oai-tts-finetuning.git
-cd oai-tts-finetuning
+cd oai-tts-finetuning/orpheus-tts
 
 # ConfigMap (scripts) + PVC
 oc kustomize . | oc apply -f - -n <namespace>

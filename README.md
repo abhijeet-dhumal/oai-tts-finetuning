@@ -28,24 +28,14 @@ Audio samples and charts live on the [HF model card](https://huggingface.co/AbDh
 
 ```
 ├── scripts/
-│   ├── train_orpheus.py
-│   ├── evaluate_orpheus.py
-│   ├── save_final_orpheus.py
-│   ├── stage_hf_samples.py
-│   ├── upload_to_hf.py
-│   └── export_mlflow_snapshots.py
 ├── manifests/
-│   ├── pvc.yaml
-│   ├── trainjob-orpheus.yaml
-│   ├── trainjob-orpheus-eval.yaml
-│   └── job-hf-upload.yaml
-├── huggingface/          # model card template + eval charts
+├── huggingface/          # model card + eval charts + MLflow UI screenshots
 ├── kustomization.yaml
 ├── ARCHITECTURE.md
 └── README.md
 ```
 
-> **Archive:** the prior multi-example layout (`orpheus-tts/` + `vits-tts/` subdirs) is preserved on branch [`archive/multi-example-layout`](https://github.com/abhijeet-dhumal/oai-tts-finetuning/tree/archive/multi-example-layout).
+> **Archive:** prior multi-example layout (`orpheus-tts/` + `vits-tts/`) → [`archive/multi-example-layout`](https://github.com/abhijeet-dhumal/oai-tts-finetuning/tree/archive/multi-example-layout)
 
 ---
 
@@ -119,7 +109,12 @@ Experiment: `orpheus-turkish-tts`
 | Training v2 | `6804b44335f347849f26da2736aa73df` | loss, in-train audio, WER/CER |
 | Eval v4 | `50c177d696164b4a83169292b2109b4e` | 10-sentence benchmark |
 
-Static chart exports: [`huggingface/eval/mlflow/`](huggingface/eval/mlflow/)
+Static chart exports + MLflow UI screenshots: [`huggingface/eval/mlflow/`](huggingface/eval/mlflow/)
+
+| Screenshot | What it shows |
+|------------|---------------|
+| [ui_traces_pipeline](huggingface/eval/mlflow/ui_traces_pipeline.png) | Traces: `orpheus_tts_pipeline` spans, RTF, duration |
+| [ui_artifacts_audio](huggingface/eval/mlflow/ui_artifacts_audio.png) | Artifacts: step audio + waveform preview |
 
 ---
 
